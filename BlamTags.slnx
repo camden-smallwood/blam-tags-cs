@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BlamTags.Shell/BlamTags.Shell.csproj" />
+    <Project Path="src/BlamTags/BlamTags.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BlamTags.Tests/BlamTags.Tests.csproj" />
+  </Folder>
+</Solution>

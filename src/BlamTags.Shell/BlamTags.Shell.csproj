@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\BlamTags\BlamTags.csproj" />
+  </ItemGroup>
+
+  <!-- Ship the schema definitions next to the binary so a built/published
+       blam-tag-shell resolves `definitions/<game>/` standalone (matching
+       Definitions.FindRoot's "next to the executable" probe). PreserveNewest
+       keeps incremental builds cheap after the first copy. -->
+  <ItemGroup>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\definitions\**\*.json"
+             Link="definitions\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
