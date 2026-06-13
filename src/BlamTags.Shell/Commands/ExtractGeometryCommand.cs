@@ -53,8 +53,12 @@ public static class ExtractGeometryCommand
             "hlmt" => RunHlmt(ctx, kinds, output, flat, ParseForce(force)),
             "scnr" => RunScenario(ctx, RejectHlmtOnly(kinds, force, "scenario", output), flat),
             "sbsp" => RunSbsp(ctx, RejectHlmtOnly(kinds, force, "scenario_structure_bsp", output)),
+            // Halo CE references a gbxmodel (mod2) directly — no .model wrapper.
+            "mod2" => RunGbxmodel(ctx, RejectHlmtOnly(kinds, force, "gbxmodel", output), flat),
+            // Direct collision input: CE model_collision_geometry or H2/H3 collision_model.
+            "coll" => RunCollision(ctx, RejectHlmtOnly(kinds, force, "collision_model", output), flat),
             _ => throw new CliError(
-                $"extract-geometry expects `.model` (hlmt), `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) — got group `{group}`."),
+                $"extract-geometry expects `.model` (hlmt), `.gbxmodel` (mod2, Halo CE), `.collision_model`/`.model_collision_geometry` (coll), `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) — got group `{group}`."),
         };
     }
 
@@ -98,6 +102,11 @@ public static class ExtractGeometryCommand
         string stem = Path.GetFileNameWithoutExtension(loaded.Path);
         string outRoot = output ?? ".";
         var root = loaded.Tag.Root;
+        // Engine drives both the render reader (Halo 2 uses a section-based
+        // structure) and the JMS version (CE 8200 / H2 8210 / H3+ 8213). The
+        // .model and every tag it references share the engine.
+        var game = loaded.Tag.GameOf();
+        int version = game.JmsVersion();
 
         string? renderRef = TagRef(root, KindModelField(Kind.Render));
         string? collisionRef = TagRef(root, KindModelField(Kind.Collision));
@@ -114,7 +123,7 @@ public static class ExtractGeometryCommand
 
         bool needSkeleton = selected.Contains(Kind.Collision) || selected.Contains(Kind.Physics);
         JmsFile? renderJms = (renderTag is not null && (renderFormat == "jms" || needSkeleton))
-            ? JmsFile.FromRenderModel(renderTag) : null;
+            ? ReadRenderJms(renderTag, game) : null;
         IReadOnlyList<JmsNode>? skeleton = renderJms?.Nodes;
 
         var emitted = new List<(string Path, string Summary)>();
@@ -136,9 +145,9 @@ public static class ExtractGeometryCommand
                     }
                     else
                     {
-                        var jmsR = renderJms ?? JmsFile.FromRenderModel(renderTag);
+                        var jmsR = renderJms ?? ReadRenderJms(renderTag, game);
                         string path = OutputPathFor(outRoot, stem, kind, flat, "jms");
-                        WriteJms(path, jmsR);
+                        WriteJms(path, jmsR, version);
                         emitted.Add((path, $"[render: JMS]  {JmsSummary(jmsR)}"));
                     }
                     break;
@@ -149,7 +158,7 @@ public static class ExtractGeometryCommand
                         var t = ctx.LoadReferencedTag(collisionRef, KindExt(kind));
                         var jms = JmsFile.FromCollisionModelWithSkeleton(t, skeleton);
                         string path = OutputPathFor(outRoot, stem, kind, flat, "jms");
-                        WriteJms(path, jms);
+                        WriteJms(path, jms, version);
                         emitted.Add((path, $"[collision] {JmsSummary(jms)}"));
                     }
                     break;
@@ -158,9 +167,13 @@ public static class ExtractGeometryCommand
                     if (skeleton is null) { skipped.Add((kind, "needs render_model for skeleton")); break; }
                     {
                         var t = ctx.LoadReferencedTag(physicsRef, KindExt(kind));
-                        var jms = JmsFile.FromPhysicsModelWithSkeleton(t, skeleton);
+                        // Halo 2 stores Havok shapes flat (parented by a
+                        // rigid-body shape reference); Halo 3 nests them.
+                        var jms = game == Game.Halo2
+                            ? JmsFile.FromPhysicsModelH2WithSkeleton(t, skeleton)
+                            : JmsFile.FromPhysicsModelWithSkeleton(t, skeleton);
                         string path = OutputPathFor(outRoot, stem, kind, flat, "jms");
-                        WriteJms(path, jms);
+                        WriteJms(path, jms, version);
                         emitted.Add((path, $"[physics]   {JmsSummary(jms)}"));
                     }
                     break;
@@ -170,6 +183,43 @@ public static class ExtractGeometryCommand
         foreach (var (path, summary) in emitted) Console.WriteLine($"{path}: {summary}");
         foreach (var (kind, reason) in skipped) Console.Error.WriteLine($"skipped {KindStr(kind)}: {reason}");
         if (emitted.Count == 0) throw new CliError("nothing emitted — all selected kinds were skipped");
+        return 0;
+    }
+
+    // mod2 → Halo CE gbxmodel render geometry → JMS (version 8200)
+    private static int RunGbxmodel(CliContext ctx, string? output, bool flat)
+    {
+        var loaded = ctx.LoadedOrThrow("extract-geometry");
+        int version = loaded.Tag.GameOf().JmsVersion();
+        var jms = JmsFile.FromGbxmodel(loaded.Tag);
+        string stem = Path.GetFileNameWithoutExtension(loaded.Path);
+        string outRoot = output ?? ".";
+        string path = OutputPathFor(outRoot, stem, Kind.Render, flat, "jms");
+        WriteJms(path, jms, version);
+        Console.WriteLine($"{path}: [render: JMS] {JmsSummary(jms)}");
+        return 0;
+    }
+
+    /// <summary>Build the render-model JMS with the engine-correct reader.</summary>
+    private static JmsFile ReadRenderJms(TagFile tag, Game game) => game switch
+    {
+        Game.Halo1 => JmsFile.FromGbxmodel(tag),
+        Game.Halo2 => JmsFile.FromH2RenderModel(tag),
+        _ => JmsFile.FromRenderModel(tag),
+    };
+
+    // coll → direct collision (CE model_collision_geometry / H2+H3 collision_model)
+    private static int RunCollision(CliContext ctx, string? output, bool flat)
+    {
+        var loaded = ctx.LoadedOrThrow("extract-geometry");
+        var game = loaded.Tag.GameOf();
+        var jms = game == Game.Halo1
+            ? JmsFile.FromModelCollisionGeometry(loaded.Tag)
+            : JmsFile.FromCollisionModel(loaded.Tag);
+        string stem = Path.GetFileNameWithoutExtension(loaded.Path);
+        string path = OutputPathFor(output ?? ".", stem, Kind.Collision, flat, "jms");
+        WriteJms(path, jms, game.JmsVersion());
+        Console.WriteLine($"{path}: [collision] {JmsSummary(jms)}");
         return 0;
     }
 
@@ -243,10 +293,31 @@ public static class ExtractGeometryCommand
         var loaded = ctx.LoadedOrThrow("extract-geometry");
         string stem = Path.GetFileNameWithoutExtension(loaded.Path);
         string outRoot = output ?? ".";
-        string path = Path.Combine(outRoot, $"{stem}.ASS");
+        var game = loaded.Tag.GameOf();
 
-        var ass = AssFile.FromScenarioStructureBsp(loaded.Tag);
-        WriteAss(path, ass);
+        // Halo CE compiles levels from JMS, not ASS — emit render + collision
+        // JMS for a CE structure_bsp. H2/H3 emit ASS.
+        if (game == Game.Halo1)
+        {
+            int version = game.JmsVersion();
+            var renderJms = JmsFile.FromScenarioStructureBspCe(loaded.Tag);
+            string rpath = OutputPathFor(outRoot, stem, Kind.Render, false, "jms");
+            WriteJms(rpath, renderJms, version);
+            Console.WriteLine($"{rpath}: [sbsp render: JMS] {JmsSummary(renderJms)}");
+            var collJms = JmsFile.FromScenarioStructureBspCeCollision(loaded.Tag);
+            string cpath = OutputPathFor(outRoot, stem, Kind.Collision, false, "jms");
+            WriteJms(cpath, collJms, version);
+            Console.WriteLine($"{cpath}: [sbsp collision: JMS] {JmsSummary(collJms)}");
+            return 0;
+        }
+
+        // H2 → ASS v2 (section-based geometry); H3 → ASS v7.
+        int assVersion = game.AssVersion() ?? 7;
+        string path = Path.Combine(outRoot, $"{stem}.ASS");
+        var ass = game == Game.Halo2
+            ? AssFile.FromScenarioStructureBspH2(loaded.Tag)
+            : AssFile.FromScenarioStructureBsp(loaded.Tag);
+        WriteAss(path, ass, assVersion);
         Console.WriteLine($"{path}: [sbsp] {AssSummary(ass)} (no lighting — pass scenario for lights)");
         return 0;
     }
@@ -259,18 +330,18 @@ public static class ExtractGeometryCommand
         ? Path.Combine(outRoot, $"{stem}.{KindStr(kind)}.{ext}")
         : Path.Combine(outRoot, stem, KindStr(kind), $"{stem}.{ext.ToUpperInvariant()}");
 
-    private static void WriteJms(string path, JmsFile jms)
+    private static void WriteJms(string path, JmsFile jms, int version = 8213)
     {
         EnsureParent(path);
         using var fs = File.Create(path);
-        jms.Write(fs);
+        jms.Write(fs, version);
     }
 
-    private static void WriteAss(string path, AssFile ass)
+    private static void WriteAss(string path, AssFile ass, int version = 7)
     {
         EnsureParent(path);
         using var fs = File.Create(path);
-        ass.Write(fs);
+        ass.Write(fs, version);
     }
 
     private static void EnsureParent(string path)

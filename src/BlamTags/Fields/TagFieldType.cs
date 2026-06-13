@@ -79,6 +79,10 @@ public enum TagFieldType
     ApiInterop,
     Terminator,
     NonCacheRuntimeValue,
+    /// <summary>Classic (Halo CE / H2) 4-byte cache pointer — opaque, raw-only.</summary>
+    Pointer,
+    /// <summary>Classic 3x3 float matrix (36 bytes) — raw-only.</summary>
+    RealMatrix3x3,
 }
 
 public static class TagFieldTypeExtensions
@@ -159,6 +163,8 @@ public static class TagFieldTypeExtensions
         "api interop" => TagFieldType.ApiInterop,
         "terminator X" => TagFieldType.Terminator,
         "non-cache runtime value" => TagFieldType.NonCacheRuntimeValue,
+        "pointer" => TagFieldType.Pointer,
+        "real matrix 3x3" => TagFieldType.RealMatrix3x3,
         _ => TagFieldType.Unknown,
     };
 }

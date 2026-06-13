@@ -31,6 +31,13 @@ internal sealed class TagSchemaJson
     [JsonPropertyName("datas")] public Dictionary<string, DataJson> Datas { get; set; } = new();
     [JsonPropertyName("resources")] public Dictionary<string, ResourceJson> Resources { get; set; } = new();
     [JsonPropertyName("interops")] public Dictionary<string, InteropJson> Interops { get; set; } = new();
+
+    /// <summary>Classic Halo 2 versioned layouts: <c>base struct name →
+    /// (on-disk version → variant struct name)</c>. A block/struct element's
+    /// 16-byte header carries a version that selects which FieldSet variant
+    /// to decode. Empty for MCC (gen3) and Halo CE schemas.</summary>
+    [JsonPropertyName("struct_versions")]
+    public Dictionary<string, Dictionary<string, string>> StructVersions { get; set; } = new();
 }
 
 internal sealed class BlockJson
@@ -44,6 +51,10 @@ internal sealed class StructJson
     [JsonPropertyName("guid")] public string Guid { get; set; } = "";
     [JsonPropertyName("size")] public uint Size { get; set; }
     [JsonPropertyName("fields")] public List<FieldJson> Fields { get; set; } = new();
+    /// <summary>Classic Halo 2 inline-struct 4cc tag (e.g. <c>masd</c>). When
+    /// present, this struct carries a 16-byte block-style header on disk whose
+    /// version selects its FieldSet variant. Null = untagged (always v0).</summary>
+    [JsonPropertyName("tag")] public string? Tag { get; set; }
 }
 
 internal sealed class FieldJson

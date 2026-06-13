@@ -141,7 +141,7 @@ internal static class Navigation
             var field = layout.Fields[fieldIndex];
             if (field.FieldType == TagFieldType.Terminator)
                 return null;
-            if (layout.GetString(field.NameOffset) == name)
+            if (TagStructData.FieldNameMatches(layout.GetString(field.NameOffset), name))
             {
                 uint typeNameOffset = layout.FieldTypes[(int)field.TypeIndex].NameOffset;
                 string typeName = layout.GetString(typeNameOffset) ?? "";

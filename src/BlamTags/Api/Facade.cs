@@ -56,6 +56,12 @@ public sealed class TagStruct
     /// <summary>Size in bytes of one instance of this struct.</summary>
     public int SizeBytes => Size;
 
+    /// <summary>This struct element's raw fixed bytes (the slice of the
+    /// enclosing block's buffer it occupies). Used to read fields the
+    /// generated schema leaves unnamed — e.g. Halo 2 rigid-body shape
+    /// references at a fixed offset. Mirrors the Rust <c>TagStruct::raw</c>.</summary>
+    public ReadOnlySpan<byte> RawSpan => Buffer.AsSpan(Offset, Size);
+
     /// <summary>Walk fields in declaration order, skipping padding /
     /// explanation / terminator / unknown.</summary>
     public IEnumerable<TagField> Fields()
@@ -156,6 +162,18 @@ public sealed class TagStruct
         _ => null,
     };
 
+    /// <summary>Read a name-bearing field as a string, handling both inline
+    /// <c>string</c>/<c>long string</c> (classic CE/H2) and <c>string id</c>
+    /// (gen3) forms. Null if missing/empty.</summary>
+    public string? ReadString(string name) => Field(name)?.Value switch
+    {
+        TagFieldData.String v => string.IsNullOrEmpty(v.Value) ? null : v.Value,
+        TagFieldData.LongString v => string.IsNullOrEmpty(v.Value) ? null : v.Value,
+        TagFieldData.StringId v => string.IsNullOrEmpty(v.Value.Value) ? null : v.Value.Value,
+        TagFieldData.OldStringId v => string.IsNullOrEmpty(v.Value.Value) ? null : v.Value.Value,
+        _ => null,
+    };
+
     /// <summary>Read an enum field's resolved variant name (any width).</summary>
     public string? ReadEnumName(string name) => Field(name)?.Value switch
     {
@@ -195,6 +213,17 @@ public sealed class TagStruct
         TagFieldData.RealPoint3dValue v => v.Value,
         null => default,
         var other => throw MathTypeMismatch(name, "RealPoint3d", other),
+    };
+
+    /// <summary>Read a 3-float field as a point, accepting either
+    /// <c>real_point_3d</c> or <c>real_vector_3d</c> (H2/H3 declare node
+    /// translations as the former, Halo CE as the latter). Zero when missing.</summary>
+    public RealPoint3d ReadPointOrVec(string name) => Field(name)?.Value switch
+    {
+        TagFieldData.RealPoint3dValue v => v.Value,
+        TagFieldData.RealVector3dValue v => new RealPoint3d(v.Value.I, v.Value.J, v.Value.K),
+        null => default,
+        var other => throw MathTypeMismatch(name, "RealPoint3d/RealVector3d", other),
     };
 
     /// <summary>Read a <c>real_vector_3d</c> field. Zero when missing; throws on
@@ -284,7 +313,7 @@ public sealed class TagField(TagStruct owner, int fieldIndex)
         if (FieldType is TagFieldType.Struct or TagFieldType.Block
             or TagFieldType.Array or TagFieldType.PageableResource)
             throw new InvalidOperationException($"field '{Name}' is a container and is not directly assignable");
-        Owner.Data.SetField(Owner.Layout, Owner.Buffer.AsSpan(Owner.Offset, Owner.Size), FieldIndex, value);
+        Owner.Data.SetField(Owner.Layout, Owner.Buffer.AsSpan(Owner.Offset, Owner.Size), FieldIndex, value, Owner.Endian);
     }
 
     /// <summary>Step into a struct field (null if not a struct or missing).</summary>

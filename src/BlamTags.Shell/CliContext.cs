@@ -91,11 +91,36 @@ public sealed class CliContext
     /// <summary>Load a tag file into <see cref="Loaded"/>, resetting nav.</summary>
     public void Load(string path)
     {
+        byte[] bytes;
+        try { bytes = File.ReadAllBytes(path); }
+        catch (Exception e) { throw new CliError($"failed to load tag file: {e.Message}"); }
         TagFile tag;
-        try { tag = TagFile.Read(path); }
+        try { tag = ReadTagFromBytes(bytes); }
+        catch (CliError) { throw; }
         catch (Exception e) { throw new CliError($"failed to load tag file: {e.Message}"); }
         Loaded = new LoadedTag(path, tag);
         Nav.Clear();
+    }
+
+    /// <summary>Parse tag bytes, routing classic (Halo CE / Halo 2) loose tags
+    /// through the classic decoder and MCC self-describing tags through the
+    /// embedded-layout reader. Classic tags carry no layout chunk, so a
+    /// <c>--game</c> is required to locate the group's JSON schema.</summary>
+    private TagFile ReadTagFromBytes(byte[] bytes)
+    {
+        var classic = Classic.ParseHeader(bytes);
+        if (classic is not { } parsed)
+            return TagFile.ReadFromBytes(bytes);
+
+        if (Game is null)
+            throw new CliError(
+                "classic Halo CE / Halo 2 tags carry no embedded layout — pass a `--game` (e.g. `--game halo2_mcc`)");
+
+        uint groupTag = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(parsed.Header.GroupTag);
+        string? name = TagIndex.NameFor(groupTag)
+            ?? throw new CliError($"no group definition for group tag \"{GroupTag.Format(groupTag)}\" in definitions/{Game}/");
+        var layout = TagLayout.FromJson(SchemaPath(name));
+        return Classic.ReadClassicTagFile(bytes, layout);
     }
 
     public LoadedTag LoadedOrThrow(string command) =>
@@ -112,7 +137,8 @@ public sealed class CliContext
         string tagsRoot = TagPaths.DeriveTagsRoot(loaded.Path)
             ?? throw new CliError("failed to derive tags root from input path — input must live under a `tags/` directory");
         string path = TagPaths.ResolveTagPath(tagsRoot, relPath, groupExt);
-        try { return TagFile.Read(path); }
+        try { return ReadTagFromBytes(File.ReadAllBytes(path)); }
+        catch (CliError) { throw; }
         catch (Exception e) { throw new CliError($"failed to read {path}: {e.Message}"); }
     }
 

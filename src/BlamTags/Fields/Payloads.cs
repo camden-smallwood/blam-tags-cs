@@ -23,7 +23,11 @@ public sealed class TagReferenceData
         uint groupTag = endian == Endian.Le
             ? BinaryPrimitives.ReadUInt32LittleEndian(payload)
             : BinaryPrimitives.ReadUInt32BigEndian(payload);
-        string name = Encoding.UTF8.GetString(payload[4..]);
+        // Classic (CE/H2) payloads store the path NUL-terminated (group +
+        // path + NUL); strip the terminator from the display/extraction name.
+        // Re-encode uses the raw payload bytes, so this never affects
+        // byte-exact roundtrip. Modern payloads carry no NUL (no-op).
+        string name = Encoding.UTF8.GetString(payload[4..]).TrimEnd('\0');
         return new TagReferenceData { GroupTagAndName = (groupTag, name) };
     }
 

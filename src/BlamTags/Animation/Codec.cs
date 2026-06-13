@@ -99,7 +99,7 @@ public static class AnimationCodec
         int animatedOffset = staticSize;
         int animatedBlobLen = layout switch
         {
-            SizeLayout.Reach => (int)(group.DataSizes is { } d && d.Fields.Count > 1 ? d.Fields[1].Value : 0),
+            SizeLayout.Reach or SizeLayout.Halo2 => (int)(group.DataSizes is { } d && d.Fields.Count > 1 ? d.Fields[1].Value : 0),
             _ => System.Math.Max(0, blob.Length - animatedOffset),
         };
 
@@ -136,7 +136,7 @@ public static class AnimationCodec
             };
             animatedCodecSize = layout switch
             {
-                SizeLayout.Reach => group.DataSizes is { } d && d.Fields.Count > 1 ? (int)d.Fields[1].Value : null,
+                SizeLayout.Reach or SizeLayout.Halo2 => group.DataSizes is { } d && d.Fields.Count > 1 ? (int)d.Fields[1].Value : null,
                 _ => animatedStatus is AnimatedStreamStatus.Decoded && FromByte(animByte) is { } c
                     ? AnimatedCodecStreamSize(animBlob, c) : null,
             };
@@ -146,7 +146,7 @@ public static class AnimationCodec
         if (group.DataSizes is { } ds)
         {
             int off; int staticTotal; int animatedTotal;
-            if (layout == SizeLayout.Reach)
+            if (layout is SizeLayout.Reach or SizeLayout.Halo2)
             {
                 off = (int)ds.Fields.Take(2).Sum(f => f.Value);
                 staticTotal = (int)(ds.Fields.Count > 2 ? ds.Fields[2].Value : 0);
@@ -166,7 +166,7 @@ public static class AnimationCodec
         if (group.DataSizes is { } ds2)
         {
             int off, size;
-            if (layout == SizeLayout.Reach)
+            if (layout is SizeLayout.Reach or SizeLayout.Halo2)
             {
                 off = (int)ds2.Fields.Take(4).Sum(f => f.Value);
                 size = (int)(ds2.Fields.Count > 4 ? ds2.Fields[4].Value : 0);
@@ -200,6 +200,25 @@ public static class AnimationCodec
 
     //==== movement + flags ====
 
+    // Per-frame movement rotation deltas, built at read time so the writer can
+    // accumulate them as quaternions (matching the Rust/Foundry fold). f32
+    // sin/cos via the double path (correctly-rounded — matches Rust libm).
+    private static RealQuaternion YawQuat(float yaw)
+    {
+        float half = yaw * 0.5f;
+        return new RealQuaternion(0f, 0f, (float)System.Math.Sin(half), (float)System.Math.Cos(half));
+    }
+
+    private static RealQuaternion AngleAxisQuat(float x, float y, float z)
+    {
+        float angle = MathF.Sqrt(x * x + y * y + z * z);
+        if (angle <= 1e-8f) return new RealQuaternion(0f, 0f, 0f, 1f);
+        float half = angle * 0.5f;
+        float s = (float)System.Math.Sin(half), c = (float)System.Math.Cos(half);
+        float k = s / angle;
+        return new RealQuaternion(x * k, y * k, z * k, c);
+    }
+
     private static MovementData ReadMovementAt(byte[] blob, int offset, int movementBytes, string? frameInfoType, int frameCount)
     {
         MovementKind kind = frameInfoType is null ? MovementKind.None : MovementKindExtensions.FromSchemaName(frameInfoType);
@@ -215,10 +234,20 @@ public static class AnimationCodec
             var f = new MovementFrame();
             switch (kind)
             {
-                case MovementKind.DxDy: f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); break;
-                case MovementKind.DxDyDyaw: f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dyaw = F32(blob, off + 8); break;
-                case MovementKind.DxDyDzDyaw: f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dz = F32(blob, off + 8); f.Dyaw = F32(blob, off + 12); break;
-                case MovementKind.DxDyDzDangleAxis: f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dz = F32(blob, off + 8); f.Dyaw = F32(blob, off + 20); break;
+                case MovementKind.DxDy:
+                    f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); break;
+                case MovementKind.DxDyDyaw:
+                    f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dyaw = F32(blob, off + 8);
+                    f.Rotation = YawQuat(f.Dyaw); break;
+                case MovementKind.DxDyDzDyaw:
+                    f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dz = F32(blob, off + 8); f.Dyaw = F32(blob, off + 12);
+                    f.Rotation = YawQuat(f.Dyaw); break;
+                case MovementKind.DxDyDzDangleAxis:
+                    f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dz = F32(blob, off + 8);
+                    f.Rotation = AngleAxisQuat(F32(blob, off + 12), F32(blob, off + 16), F32(blob, off + 20)); break;
+                case MovementKind.XyzAbsolute:
+                    // Absolute root position, no rotation.
+                    f.Dx = F32(blob, off); f.Dy = F32(blob, off + 4); f.Dz = F32(blob, off + 8); break;
             }
             frames.Add(f);
         }

@@ -53,6 +53,35 @@ public sealed partial class TagLayout
     /// <summary><c>stv2</c>/<c>stv4</c> — struct definitions.</summary>
     public required List<TagStructLayout> StructLayouts { get; init; }
 
+    /// <summary>Classic Halo 2 per-struct inline-tag (4cc, BE-packed; 0 =
+    /// untagged), parallel to <see cref="StructLayouts"/>. A tagged struct
+    /// carries a 16-byte block-style header on disk. Empty for MCC / CE.</summary>
+    public List<uint> StructTags { get; init; } = [];
+
+    /// <summary>Classic Halo 2 per-base-struct version → variant-struct-index
+    /// table, parallel to <see cref="StructLayouts"/>. Non-null only for a
+    /// multi-version base struct: entry <c>[n]</c> is the variant struct index
+    /// for on-disk version <c>n</c> (gaps padded with the base index). Empty
+    /// for MCC / CE (single-version schemas).</summary>
+    public List<uint[]?> StructVersionTable { get; init; } = [];
+
+    /// <summary>Resolve a base (latest) struct index to its variant for the
+    /// given on-disk <paramref name="version"/>. Returns <paramref name="baseIndex"/>
+    /// for single-version structs, out-of-range versions, or empty tables.</summary>
+    public uint ResolveVersionVariant(uint baseIndex, uint version)
+    {
+        if (baseIndex < (uint)StructVersionTable.Count
+            && StructVersionTable[(int)baseIndex] is { } variants
+            && version < (uint)variants.Length)
+            return variants[(int)version];
+        return baseIndex;
+    }
+
+    /// <summary>The classic inline 4cc tag of a struct (0 = untagged), or 0
+    /// when out of range / no table.</summary>
+    public uint StructTag(uint structIndex) =>
+        structIndex < (uint)StructTags.Count ? StructTags[(int)structIndex] : 0;
+
     /// <summary>
     /// Resolve a name offset into the UTF-8 string at that position in
     /// <see cref="StringData"/> (null-terminated). Returns <c>null</c> for an

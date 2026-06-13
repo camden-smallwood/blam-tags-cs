@@ -13,6 +13,12 @@ internal sealed class TagStructData
     /// emission order.</summary>
     public required List<TagSubChunkEntry> SubChunks { get; init; }
 
+    /// <summary>Classic Halo 2 tagged-inline-struct header (e.g. <c>masd</c> +
+    /// version + count + size) that precedes this struct's trailing data on
+    /// disk. Preserved verbatim for byte-exact round-trip; its version selects
+    /// the FieldSet variant. Null for untagged structs / CE / MCC.</summary>
+    public byte[]? ClassicStructHeader { get; init; }
+
     private static readonly uint TgstSig = Tag.Of("tgst");
 
     /// <summary>Parse a <c>tgst</c> chunk: header + sub-chunks (+ trailing
@@ -402,10 +408,24 @@ internal sealed class TagStructData
             var field = layout.Fields[fieldIndex];
             if (field.FieldType == TagFieldType.Terminator)
                 return null;
-            if (layout.GetString(field.NameOffset) == name)
+            if (FieldNameMatches(layout.GetString(field.NameOffset), name))
                 return fieldIndex;
             fieldIndex++;
         }
+    }
+
+    /// <summary>Match a stored field name against a lookup query, tolerating a
+    /// trailing <c>|CODE</c> suffix. Some definitions (notably the Halo 2
+    /// <c>model_animation_graph</c>) carry a dumper-artifact suffix on block
+    /// field names — e.g. <c>animations|ABCDCC</c> — where the part after
+    /// <c>|</c> is a name-code, not part of the addressable name. Callers look
+    /// the field up as plain <c>animations</c>, so we compare the stored
+    /// name's pre-<c>|</c> segment. An exact match (no <c>|</c>) still works.</summary>
+    public static bool FieldNameMatches(string? stored, string query)
+    {
+        if (stored is null) return false;
+        int pipe = stored.IndexOf('|');
+        return pipe < 0 ? stored == query : stored.AsSpan(0, pipe).SequenceEqual(query);
     }
 
     /// <summary>User-addressable field names in declaration order (skips
@@ -447,9 +467,9 @@ internal sealed class TagStructData
     /// <summary>Write a value back. Primitive values mutate
     /// <paramref name="structRaw"/>; sub-chunk-leaf values swap the matching
     /// entry's content (which must already exist).</summary>
-    public void SetField(TagLayout layout, Span<byte> structRaw, int fieldIndex, TagFieldData value)
+    public void SetField(TagLayout layout, Span<byte> structRaw, int fieldIndex, TagFieldData value, Endian endian)
     {
-        var newContent = TagFieldCodec.Serialize(layout.Fields[fieldIndex], value, structRaw);
+        var newContent = TagFieldCodec.Serialize(layout.Fields[fieldIndex], value, structRaw, endian);
         if (newContent is null)
             return;
         foreach (var entry in SubChunks)
@@ -486,6 +506,7 @@ internal sealed class TagStructData
             FieldIndex = e.FieldIndex,
             Content = CloneContent(e.Content),
         }).ToList(),
+        ClassicStructHeader = (byte[]?)ClassicStructHeader?.Clone(),
     };
 
     private static TagSubChunkContent CloneContent(TagSubChunkContent c) => c switch

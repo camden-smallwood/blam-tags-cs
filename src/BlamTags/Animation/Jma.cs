@@ -37,7 +37,6 @@ public static class JmaKindExtensions
     public static bool FoldsMovement(this JmaKind k) => k is JmaKind.Jma or JmaKind.Jmt or JmaKind.Jmz;
     public static bool PrependsRestPose(this JmaKind k) => k is JmaKind.Jmo or JmaKind.Jmr;
     public static bool AppendsHeldFrame(this JmaKind k) => k is JmaKind.Jmm or JmaKind.Jma or JmaKind.Jmt or JmaKind.Jmz or JmaKind.Jmw;
-    public static bool ComposesOverlay(this JmaKind k) => k is JmaKind.Jmo;
 }
 
 /// <summary>Serializes a composed <see cref="Pose"/> into a JMA-family text
@@ -94,76 +93,64 @@ public static class JmaWriter
                 WriteTransform(w, transform);
 
         var accumulatedTranslation = default(RealPoint3d);
-        float accumulatedYaw = 0.0f;
+        var accumulatedRotation = new RealQuaternion(0, 0, 0, 1);
+        bool absolute = movement?.Kind.IsAbsolute() ?? false;
 
         for (int frameIdx = 0; frameIdx < pose.Frames.Count; frameIdx++)
         {
-            if (kind.FoldsMovement())
-            {
-                var local = movement is not null && frameIdx < movement.Frames.Count ? movement.Frames[frameIdx] : default;
-                AdvanceMovement(ref accumulatedTranslation, ref accumulatedYaw, local);
-            }
             var frame = pose.Frames[frameIdx];
             for (int boneIdx = 0; boneIdx < frame.Count; boneIdx++)
-                WriteTransform(w, ComposeFrameBone(frame[boneIdx], boneIdx, defaults, accumulatedTranslation, accumulatedYaw, kind));
+                WriteTransform(w, ComposeFrameBone(frame[boneIdx], boneIdx, accumulatedTranslation, accumulatedRotation, kind));
+            // Advance AFTER writing so frame 0 holds the rest pose and
+            // movement begins accumulating from frame 1 (Foundry's
+            // frame-0-is-rest / zero-prepend convention; matches the Rust writer).
+            if (kind.FoldsMovement() && movement is not null && frameIdx < movement.Frames.Count)
+                AdvanceMovement(ref accumulatedTranslation, ref accumulatedRotation, movement.Frames[frameIdx], absolute);
         }
 
         if (kind.AppendsHeldFrame())
         {
             var lastFrame = pose.Frames[codecCount - 1];
             for (int boneIdx = 0; boneIdx < lastFrame.Count; boneIdx++)
-                WriteTransform(w, ComposeFrameBone(lastFrame[boneIdx], boneIdx, defaults, accumulatedTranslation, accumulatedYaw, kind));
+                WriteTransform(w, ComposeFrameBone(lastFrame[boneIdx], boneIdx, accumulatedTranslation, accumulatedRotation, kind));
         }
     }
 
-    // Rust's `f32::sin/cos` (movement-yaw fold) round to the correctly-rounded
-    // f32, which `MathF.Sin/Cos` (a faster approximation) miss by ~1 ULP.
-    // Computing in double and narrowing reproduces the correctly-rounded result
-    // and matches the oracle on all but a handful of exact-boundary yaw values.
-    private static float SinF(float x) => (float)System.Math.Sin(x);
-    private static float CosF(float x) => (float)System.Math.Cos(x);
-
-    private static void AdvanceMovement(ref RealPoint3d translation, ref float accumulatedYaw, MovementFrame local)
+    // Accumulate movement as a quaternion (matching the Rust/Foundry fold):
+    // rotate this frame's local delta into world space by the running
+    // rotation, add it, then compose the per-frame rotation delta. For
+    // absolute movement (xyz_absolute) the translation is a per-frame
+    // absolute position and no rotation is accumulated.
+    private static void AdvanceMovement(ref RealPoint3d translation, ref RealQuaternion accumulatedRotation, MovementFrame local, bool absolute)
     {
-        float cosY = CosF(accumulatedYaw), sinY = SinF(accumulatedYaw);
-        float worldDx = local.Dx * cosY - local.Dy * sinY;
-        float worldDy = local.Dx * sinY + local.Dy * cosY;
-        translation = new RealPoint3d(translation.X + worldDx, translation.Y + worldDy, translation.Z + local.Dz);
-        accumulatedYaw += local.Dyaw;
+        if (absolute)
+        {
+            translation = new RealPoint3d(local.Dx, local.Dy, local.Dz);
+            return;
+        }
+        var world = accumulatedRotation.Rotate(new RealVector3d(local.Dx, local.Dy, local.Dz));
+        translation = new RealPoint3d(translation.X + world.I, translation.Y + world.J, translation.Z + world.K);
+        accumulatedRotation = accumulatedRotation.Mul(local.Rotation).Normalized();
     }
 
+    // Fold accumulated movement into the root bone for the movement-bearing
+    // base kinds (JMA/JMT/JMZ). Overlay/replacement composition is done
+    // upstream (Animation.OverlayPose / ReplacementPose); the writer never
+    // composes overlays itself.
     private static NodeTransform ComposeFrameBone(
-        NodeTransform transform, int boneIdx, IReadOnlyList<NodeTransform> defaults,
-        RealPoint3d accumulatedTranslation, float accumulatedYaw, JmaKind kind)
+        NodeTransform transform, int boneIdx,
+        RealPoint3d accumulatedTranslation, RealQuaternion accumulatedRotation, JmaKind kind)
     {
         var t = transform.Translation;
         var q = transform.Rotation;
-        var s = transform.Scale;
-
-        if (kind.ComposesOverlay() && boneIdx < defaults.Count)
-        {
-            var bse = defaults[boneIdx];
-            t = new RealPoint3d(
-                bse.Translation.X + transform.Translation.X,
-                bse.Translation.Y + transform.Translation.Y,
-                bse.Translation.Z + transform.Translation.Z);
-            q = bse.Rotation.Mul(transform.Rotation);
-            s = bse.Scale + transform.Scale;
-        }
 
         if (kind.FoldsMovement() && boneIdx == 0)
         {
             t = new RealPoint3d(t.X + accumulatedTranslation.X, t.Y + accumulatedTranslation.Y, t.Z + accumulatedTranslation.Z);
-            q = YawQuat(accumulatedYaw).Mul(q);
+            q = accumulatedRotation.Mul(q);
         }
 
-        return new NodeTransform { Translation = t, Rotation = q, Scale = s };
-    }
-
-    private static RealQuaternion YawQuat(float yaw)
-    {
-        float half = yaw * 0.5f;
-        return new RealQuaternion(0.0f, 0.0f, SinF(half), CosF(half));
+        return new NodeTransform { Translation = t, Rotation = q, Scale = transform.Scale };
     }
 
     private static void WriteTransform(TextWriter w, NodeTransform t)
@@ -182,7 +169,12 @@ public static class JmaWriter
         for (int i = 0; i < values.Length; i++)
         {
             float v = values[i] == 0f ? 0f : values[i];
-            w.Write(v.ToString("F10", CultureInfo.InvariantCulture));
+            // Match Rust's `{:.10}`: ±inf print as `inf`/`-inf` (C#'s "F10"
+            // would emit `Infinity`); NaN prints `NaN` in both.
+            string s = float.IsPositiveInfinity(v) ? "inf"
+                : float.IsNegativeInfinity(v) ? "-inf"
+                : v.ToString("F10", CultureInfo.InvariantCulture);
+            w.Write(s);
             w.Write(i + 1 < values.Length ? '\t' : '\n');
         }
     }

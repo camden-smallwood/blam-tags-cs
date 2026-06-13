@@ -26,6 +26,18 @@ internal sealed class TagBlockData
     /// sub-chunks.</summary>
     public required List<TagStructData> Elements { get; init; }
 
+    /// <summary>Classic Halo 2 block header (12/16 bytes: <c>4cc + version +
+    /// count + size</c>) that precedes this block's elements on disk. The
+    /// version selects the element FieldSet variant; the count is re-synced
+    /// from <see cref="Elements"/> on encode. The root block carries one too.
+    /// Null for Halo CE (headerless) and MCC blocks.</summary>
+    public byte[]? ClassicBlockHeader { get; init; }
+
+    /// <summary>Trailing bytes after the structured body that no layout field
+    /// references (appended sample/cache data, Halo 2 root only). Preserved
+    /// verbatim for a byte-exact round-trip. Null otherwise.</summary>
+    public byte[]? ClassicTrailing { get; init; }
+
     /// <summary>Parse a <c>tgbl</c> chunk. Complex vs simple is decided by
     /// flags bit 0.</summary>
     public static TagBlockData Read(TagLayout layout, TagBlockLayout definition, TagReader reader)
@@ -83,9 +95,15 @@ internal sealed class TagBlockData
         writer.WriteChunkContent(Tag.Of("tgbl"), 0, body.ToArray());
     }
 
-    /// <summary>Size of one element's byte region.</summary>
+    /// <summary>Size of one element's byte region. For a populated block the
+    /// on-disk element size is authoritative as <c>RawData.Length /
+    /// Elements.Count</c> — what the classic encoder uses, and essential for
+    /// VERSIONED classic blocks whose elements aren't the schema's latest
+    /// size. Falls back to the layout struct size for empty blocks.</summary>
     public int ElementSize(TagLayout layout)
     {
+        if (Elements.Count > 0 && RawData.Length > 0)
+            return RawData.Length / Elements.Count;
         int structIndex = (int)layout.BlockLayouts[(int)BlockIndex].StructIndex;
         return layout.StructLayouts[structIndex].Size;
     }
@@ -210,5 +228,7 @@ internal sealed class TagBlockData
         RawData = (byte[])RawData.Clone(),
         Endian = Endian,
         Elements = Elements.Select(e => e.DeepClone()).ToList(),
+        ClassicBlockHeader = (byte[]?)ClassicBlockHeader?.Clone(),
+        ClassicTrailing = (byte[]?)ClassicTrailing?.Clone(),
     };
 }

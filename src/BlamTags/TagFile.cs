@@ -81,6 +81,15 @@ public sealed partial class TagFile
     internal TagStream? ImportInfoStream { get; set; }
     internal TagStream? AssetDepotStorageStream { get; set; }
 
+    /// <summary>Non-null when this tag was loaded from a classic (Halo CE /
+    /// Halo 2) loose tag rather than an MCC container. Selects the classic
+    /// 64-byte-header + flat-body writer on <see cref="WriteToBytes"/>.</summary>
+    public ClassicEngine? ClassicEngine { get; init; }
+
+    /// <summary>The original 64-byte classic header, preserved verbatim so the
+    /// writer can re-emit it (only the checksum is patched). Null for MCC.</summary>
+    internal byte[]? ClassicHeaderBytes { get; init; }
+
     /// <summary>Open <paramref name="path"/> and parse a complete tag file.</summary>
     public static TagFile Read(string path) => ReadFromBytes(File.ReadAllBytes(path));
 
@@ -135,6 +144,11 @@ public sealed partial class TagFile
     /// <summary>Serialize this tag to a new byte buffer, byte-exact.</summary>
     public byte[] WriteToBytes()
     {
+        // Classic (Halo CE / Halo 2) loose tags re-emit the 64-byte header +
+        // flat body in the engine's byte order, not the MCC chunk container.
+        if (ClassicEngine is { } engine)
+            return Classic.WriteClassicTag(this, engine, ClassicHeaderBytes!);
+
         var writer = new TagWriter();
         Header.Write(writer);
         TagStream.Write(Tag.Of("tag!"), writer);

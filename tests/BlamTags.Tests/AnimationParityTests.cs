@@ -124,14 +124,37 @@ public sealed class AnimationParityTests
         if (animation.IsEmpty || skeleton.IsEmpty) return result;
         string stem = Path.GetFileNameWithoutExtension(jmadPath);
         var defaults = BuildDefaults(skeleton, tag);
+        var graph = AnimationGraph.FromTag(tag);
 
         foreach (var group in animation.Groups)
         {
             var clip = group.Decode();
             var kind = JmaKindExtensions.FromMetadata(group.AnimationType, group.FrameInfoType, group.WorldRelative);
-            var poseDefaults = kind.ComposesOverlay() ? null : defaults;
-            var pose = clip.Pose(skeleton, poseDefaults);
-            string text = JmaWriter.ToText(pose, skeleton, defaults, group.NodeListChecksum, kind, stem, clip.Movement);
+            var baseList = (kind is JmaKind.Jmo or JmaKind.Jmr)
+                ? animation.OverlayBasePose(graph, group, skeleton, defaults) ?? defaults
+                : defaults;
+            Pose pose;
+            IReadOnlyList<NodeTransform> leading;
+            switch (kind)
+            {
+                case JmaKind.Jmo:
+                {
+                    var (reference, body) = clip.OverlayPose(skeleton, baseList);
+                    body.ApplyObjectSpaceCorrections(reference, skeleton, baseList, group.ObjectSpaceParents);
+                    (pose, leading) = (body, reference);
+                    break;
+                }
+                case JmaKind.Jmr:
+                {
+                    var body = clip.ReplacementPose(skeleton, baseList);
+                    var reference = new List<NodeTransform>(baseList);
+                    body.ApplyObjectSpaceCorrections(reference, skeleton, baseList, group.ObjectSpaceParents);
+                    (pose, leading) = (body, reference);
+                    break;
+                }
+                default: pose = clip.Pose(skeleton, defaults); leading = defaults; break;
+            }
+            string text = JmaWriter.ToText(pose, skeleton, leading, group.NodeListChecksum, kind, stem, clip.Movement);
             string name = group.Name is { } nm ? Sanitize(nm) : $"anim_{group.Index}";
             result[$"{stem}.{name}.{kind.Extension()}"] = text;
         }

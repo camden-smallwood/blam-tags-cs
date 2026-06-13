@@ -21,6 +21,9 @@ public enum TagReadErrorKind
     StringOffsetOutOfBounds,
     DuplicateOptionalStream,
     UnexpectedEof,
+    /// <summary>A classic (Halo CE / Halo 2) tag body failed to decode —
+    /// not-classic header, corrupt block header, or unconsumed trailing bytes.</summary>
+    ClassicDecode,
 }
 
 /// <summary>
@@ -66,4 +69,7 @@ public sealed class TagReadException(TagReadErrorKind kind, string message) : Ex
 
     public static TagReadException UnexpectedEof(string chunk) =>
         new(TagReadErrorKind.UnexpectedEof, $"unexpected EOF while reading \"{chunk}\"");
+
+    public static TagReadException ClassicDecode(string message) =>
+        new(TagReadErrorKind.ClassicDecode, message);
 }

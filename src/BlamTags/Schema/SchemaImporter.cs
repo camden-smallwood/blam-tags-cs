@@ -125,6 +125,8 @@ internal static class SchemaImport
         "tag_interop" => new(TagFieldType.ApiInterop, "api interop", 12, 1),
         "terminator" => new(TagFieldType.Terminator, "terminator X", 0, 0),
         "non_cache_runtime_value" => new(TagFieldType.NonCacheRuntimeValue, "non-cache runtime value", 4, 0),
+        "pointer" => new(TagFieldType.Pointer, "pointer", 4, 0),
+        "real_matrix_3x3" => new(TagFieldType.RealMatrix3x3, "real matrix 3x3", 36, 0),
         _ => null,
     };
 
@@ -157,6 +159,19 @@ internal static class SchemaImport
         foreach (char c in s)
             if (c > 0xFF)
                 throw TagSchemaException.BadGroupTag(s);
+        return ((uint)(byte)s[0] << 24) | ((uint)(byte)s[1] << 16) | ((uint)(byte)s[2] << 8) | (byte)s[3];
+    }
+
+    /// <summary>Like <see cref="ParseGroupTag"/> but returns 0 for any string
+    /// that isn't a valid 4-byte tag (mirrors Rust's <c>unwrap_or(0)</c> for
+    /// classic struct tags).</summary>
+    private static uint TryParseGroupTag(string s)
+    {
+        if (s.Length != 4)
+            return 0;
+        foreach (char c in s)
+            if (c > 0xFF)
+                return 0;
         return ((uint)(byte)s[0] << 24) | ((uint)(byte)s[1] << 16) | ((uint)(byte)s[2] << 8) | (byte)s[3];
     }
 
@@ -366,6 +381,43 @@ internal static class SchemaImport
             InteropLayoutCount = (uint)interopLayouts.Count,
         };
 
+        // Classic Halo 2 inline-struct tags (0 = untagged), parallel to the
+        // sorted struct order. A non-zero tag means the struct carries a
+        // 16-byte block-style header on disk.
+        var structTags = new List<uint>(structKeys.Count);
+        foreach (var key in structKeys)
+        {
+            string? tag = schema.Structs[key].Tag;
+            structTags.Add(string.IsNullOrEmpty(tag) ? 0u : TryParseGroupTag(tag));
+        }
+
+        // Classic Halo 2 versioned-layout table, parallel to sorted struct
+        // order. Non-null only for a base (multi-version) struct: entry [n]
+        // = variant struct index for on-disk version n, gaps padded with the
+        // base index.
+        var structVersionTable = new List<uint[]?>(structKeys.Count);
+        foreach (var key in structKeys)
+        {
+            if (!schema.StructVersions.TryGetValue(key, out var vmap) || vmap.Count == 0)
+            {
+                structVersionTable.Add(null);
+                continue;
+            }
+            // Versions parse as unsigned (mirrors Rust's `parse::<usize>()`);
+            // negative / non-numeric keys are ignored.
+            uint baseIdx = structIndex[key];
+            uint maxVer = 0;
+            foreach (var k in vmap.Keys)
+                if (uint.TryParse(k, out uint v) && v > maxVer) maxVer = v;
+            var arr = new uint[maxVer + 1];
+            Array.Fill(arr, baseIdx);
+            foreach (var (verStr, variant) in vmap)
+                if (uint.TryParse(verStr, out uint ver) && ver < arr.Length
+                    && structIndex.TryGetValue(variant, out uint vi))
+                    arr[ver] = vi;
+            structVersionTable.Add(arr);
+        }
+
         var result = new TagLayout
         {
             RootDataSize = schemaRootSize,
@@ -384,6 +436,8 @@ internal static class SchemaImport
             ResourceLayouts = resourceLayouts,
             InteropLayouts = interopLayouts,
             StructLayouts = structLayouts,
+            StructTags = structTags,
+            StructVersionTable = structVersionTable,
         };
 
         // Precompute tmpl-custom expansion sizes, keyed by global field index
@@ -483,7 +537,8 @@ internal static class SchemaImport
             or TagFieldType.AngleBounds or TagFieldType.RealBounds or TagFieldType.FractionBounds
             or TagFieldType.VertexBuffer or TagFieldType.CustomCharBlockIndex
             or TagFieldType.CustomShortBlockIndex or TagFieldType.CustomLongBlockIndex
-            or TagFieldType.Terminator or TagFieldType.NonCacheRuntimeValue)
+            or TagFieldType.Terminator or TagFieldType.NonCacheRuntimeValue
+            or TagFieldType.Pointer or TagFieldType.RealMatrix3x3)
         {
             return 0;
         }
@@ -566,6 +621,7 @@ internal static class SchemaImport
             MergeInto(schema.Datas, parent.Datas);
             MergeInto(schema.Resources, parent.Resources);
             MergeInto(schema.Interops, parent.Interops);
+            MergeInto(schema.StructVersions, parent.StructVersions);
 
             currentParent = parent.ParentTag;
         }

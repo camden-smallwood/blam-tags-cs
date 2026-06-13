@@ -21,6 +21,16 @@ public static class ExtractBitmapCommand
         var cliFormat = ParseFormat(formatStr);
         ctx.EnsureLoaded(file);
         var loaded = ctx.LoadedOrThrow("extract-bitmap");
+        string stem = Path.GetFileNameWithoutExtension(loaded.Path);
+
+        // Classic Halo CE / Halo 2 bitmaps carry the artist *color plate* — the
+        // lossless, re-importable source sheet. Always prefer it over the
+        // derivative processed pixels: the source recovers every format. gen3+
+        // MCC tags have no color plate (and a source-stripped classic tag falls
+        // through to the processed pixels below).
+        if (loaded.Tag.ClassicEngine is not null && ColorPlate.From(loaded.Tag) is { } cp)
+            return WriteColorPlate(output, stem, cp, cliFormat);
+
         Bitmap bitmap;
         try { bitmap = Bitmap.New(loaded.Tag); }
         catch (BitmapException e) { throw new CliError($"tag does not look like a .bitmap: {e.Message}"); }
@@ -28,13 +38,39 @@ public static class ExtractBitmapCommand
         int count = bitmap.Count;
         if (count == 0) { Console.WriteLine("no images in tag"); return 0; }
 
-        string stem = Path.GetFileNameWithoutExtension(loaded.Path);
         string outputPath = output ?? ".";
 
         var extFormat = FormatFromExtension(outputPath);
         if (extFormat is { } ef)
             return RunToFile(outputPath, bitmap, count, ef);
         return RunToDir(outputPath, stem, bitmap, count, cliFormat);
+    }
+
+    /// <summary>Write a classic bitmap's single color plate. <c>--output</c>
+    /// is the exact file when its extension picks a format; otherwise it's a
+    /// directory and the file is <c>&lt;dir&gt;/&lt;stem&gt;.&lt;ext&gt;</c>
+    /// using <c>--format</c>; omitted means <c>./&lt;stem&gt;.&lt;ext&gt;</c>.</summary>
+    private static int WriteColorPlate(string? output, string stem, ColorPlate cp, OutFormat cliFormat)
+    {
+        string target;
+        OutFormat format;
+        if (output is not null && FormatFromExtension(output) is { } ef)
+            (target, format) = (output, ef);
+        else if (output is not null)
+            (target, format) = (Path.Combine(output, $"{stem}.{Ext(cliFormat)}"), cliFormat);
+        else
+            (target, format) = ($"{stem}.{Ext(cliFormat)}", cliFormat);
+
+        string? parent = Path.GetDirectoryName(target);
+        if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+
+        using (var fs = File.Create(target))
+        {
+            if (format == OutFormat.Tif) cp.WriteTiff(fs);
+            else cp.WriteDds(fs);
+        }
+        Console.WriteLine($"{target}: {cp.Width}×{cp.Height} color plate (source)");
+        return 0;
     }
 
     private static OutFormat ParseFormat(string s) => s.ToLowerInvariant() switch

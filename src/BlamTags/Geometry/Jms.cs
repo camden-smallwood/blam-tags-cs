@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Globalization;
 
 namespace BlamTags;
@@ -26,6 +27,9 @@ public sealed class JmsFile
     public List<JmsConvex> ConvexShapes { get; init; } = new();
     public List<JmsRagdoll> Ragdolls { get; init; } = new();
     public List<JmsHinge> Hinges { get; init; } = new();
+    /// <summary>Region names — emitted only by the old (Halo CE, 8200) JMS
+    /// format's dedicated REGIONS section. Empty for gen3.</summary>
+    public List<string> Regions { get; init; } = new();
 
     //================================================================
     // render_model
@@ -54,6 +58,366 @@ public sealed class JmsFile
             Vertices = vertices,
             Triangles = triangles,
         };
+    }
+
+    //================================================================
+    // gbxmodel (Halo CE render geometry → JMS 8200)
+    //================================================================
+
+    /// <summary>Walk a parsed Halo CE <c>gbxmodel</c> and reconstruct the JMS
+    /// scene. CE keeps regions as a separate section + per-triangle index (not
+    /// folded into the material like gen3): one JMS material per shader, and a
+    /// part's <c>shader index</c> is its material index directly.</summary>
+    public static JmsFile FromGbxmodel(TagFile tag)
+    {
+        var root = tag.Root;
+        var worldNodes = ChainLocalToWorld(ReadNodes(root));
+
+        var shadersBlock = root.FieldPath("shaders")?.AsBlock()
+            ?? throw Missing("shaders");
+        var regionsBlock = root.FieldPath("regions")?.AsBlock()
+            ?? throw Missing("regions");
+        var geometriesBlock = root.FieldPath("geometries")?.AsBlock()
+            ?? throw Missing("geometries");
+
+        var materials = new List<JmsMaterial>(shadersBlock.Count);
+        foreach (var s in shadersBlock.Elements())
+        {
+            string path = s.ReadTagRefPath("shader") ?? "";
+            materials.Add(new JmsMaterial(FileStem(path), "<none>"));
+        }
+
+        var regions = new List<string>(regionsBlock.Count);
+        var vertices = new List<JmsVertex>();
+        var triangles = new List<JmsTriangle>();
+
+        string[] lodFields = ["super high", "high", "medium", "low", "super low"];
+        for (int ri = 0; ri < regionsBlock.Count; ri++)
+        {
+            var region = regionsBlock.Element(ri)!;
+            // Keep region indices aligned with `ri` (push every region).
+            regions.Add(region.ReadString("name") ?? "");
+            var perms = region.FieldPath("permutations")?.AsBlock();
+            if (perms is null) continue;
+            foreach (var perm in perms.Elements())
+            {
+                int geoIdx = -1;
+                foreach (var f in lodFields)
+                {
+                    long? v = perm.ReadIntAny(f);
+                    if (v is { } gv && gv >= 0 && gv < geometriesBlock.Count) { geoIdx = (int)gv; break; }
+                }
+                if (geoIdx < 0) continue;
+                var parts = geometriesBlock.Element(geoIdx)!.FieldPath("parts")?.AsBlock();
+                if (parts is null) continue;
+                foreach (var part in parts.Elements())
+                {
+                    int mat = (int)System.Math.Max(part.ReadIntAny("shader index") ?? 0, 0);
+                    var uv = part.FieldPath("uncompressed vertices")?.AsBlock();
+                    var td = part.FieldPath("triangle data")?.AsBlock();
+                    if (uv is null || td is null) continue;
+
+                    // Flatten the triangle-data chunks (each holds 3 short
+                    // `indices`) into one strip; reads in field order.
+                    var strip = new List<ushort>(td.Count * 3);
+                    foreach (var t in td.Elements())
+                        foreach (var fld in t.Fields())
+                            if (fld.Value is TagFieldData.ShortInteger si)
+                                strip.Add((ushort)si.Value);
+
+                    foreach (var (a, b, c) in Geometry.StripToList(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(strip)))
+                    {
+                        uint baseIdx = (uint)vertices.Count;
+                        foreach (uint vi in (ReadOnlySpan<uint>)[a, b, c])
+                        {
+                            var v = uv.Element((int)vi);
+                            if (v is null) continue;
+                            vertices.Add(ReadCeVertex(v));
+                        }
+                        triangles.Add(new JmsTriangle(mat, baseIdx, baseIdx + 1, baseIdx + 2) { Region = ri });
+                    }
+                }
+            }
+        }
+        return new JmsFile
+        {
+            Nodes = worldNodes,
+            Materials = materials,
+            Regions = regions,
+            Vertices = vertices,
+            Triangles = triangles,
+        };
+    }
+
+    /// <summary>Read one Halo CE uncompressed gbxmodel vertex (positions are
+    /// world units → ×100 cm; UV v is flipped).</summary>
+    private static JmsVertex ReadCeVertex(TagStruct v)
+    {
+        var p = v.ReadVec3("position");
+        var uv = v.ReadPoint2d("texture coords");
+        var nodeSets = new List<(short, float)>(2);
+        foreach (var (idxF, wtF) in new[] { ("node0 index", "node0 weight"), ("node1 index", "node1 weight") })
+        {
+            short idx = (short)(v.ReadIntAny(idxF) ?? -1);
+            float wt = v.ReadReal(wtF) ?? 0f;
+            if (idx >= 0 && wt > 0f) nodeSets.Add((idx, wt));
+        }
+        return new JmsVertex
+        {
+            Position = new RealPoint3d(p.I * Geometry.Scale, p.J * Geometry.Scale, p.K * Geometry.Scale),
+            Normal = v.ReadVec3("normal"),
+            NodeSets = nodeSets,
+            Uvs = [new RealPoint2d(uv.X, 1.0f - uv.Y)],
+        };
+    }
+
+    //================================================================
+    // Halo 2 render_model (section-based) → JMS 8210
+    //================================================================
+
+    /// <summary>Walk a parsed Halo 2 <c>render_model</c> and reconstruct the
+    /// JMS scene. H2 geometry is section-based (<c>sections[]/section data[0]/
+    /// section</c>), selected per region/permutation by a LOD section index.
+    /// Strips are u16 with a 0xFFFF restart sentinel; materials fold the
+    /// region/perm cell label like gen3.</summary>
+    public static JmsFile FromH2RenderModel(TagFile tag)
+    {
+        var root = tag.Root;
+        var worldNodes = ChainLocalToWorld(ReadNodes(root));
+        var markers = ReadMarkers(root);
+
+        var matsBlock = root.FieldPath("materials")?.AsBlock() ?? throw Missing("materials");
+        var regionsBlock = root.FieldPath("regions")?.AsBlock() ?? throw Missing("regions");
+        var sectionsBlock = root.FieldPath("sections")?.AsBlock() ?? throw Missing("sections");
+
+        var materials = new List<JmsMaterial>();
+        var vertices = new List<JmsVertex>();
+        var triangles = new List<JmsTriangle>();
+        var emittedSections = new List<int>();
+
+        string[] lodFields = ["L1 section index", "L2 section index", "L3 section index",
+                              "L4 section index", "L5 section index", "L6 section index"];
+
+        foreach (var region in regionsBlock.Elements())
+        {
+            string regionName = region.ReadStringId("name") ?? "";
+            var perms = region.FieldPath("permutations")?.AsBlock();
+            if (perms is null) continue;
+            foreach (var perm in perms.Elements())
+            {
+                string permName = perm.ReadStringId("name") ?? "";
+                int secIdx = -1;
+                foreach (var f in lodFields)
+                {
+                    long? v = perm.ReadIntAny(f);
+                    if (v is { } sv && sv >= 0 && sv < sectionsBlock.Count) { secIdx = (int)sv; break; }
+                }
+                if (secIdx < 0 || emittedSections.Contains(secIdx)) continue;
+                emittedSections.Add(secIdx);
+
+                var section = sectionsBlock.Element(secIdx)!;
+                int classification = (int)(section.ReadIntAny("global_geometry_classification_enum_definition") ?? 1);
+                short rigidNode = (short)(section.ReadIntAny("rigid node") ?? -1);
+
+                var sd = section.FieldPath("section data")?.AsBlock()?.Element(0)
+                    ?.FieldPath("section")?.AsStruct();
+                if (sd is null) continue;
+                var rawV = sd.FieldPath("raw vertices")?.AsBlock();
+                var strip = sd.FieldPath("strip indices")?.AsBlock();
+                var parts = sd.FieldPath("parts")?.AsBlock();
+                if (rawV is null || strip is null || parts is null) continue;
+
+                // H2 strip indices are u16 with a 0xFFFF restart sentinel.
+                var stripIdx = new ushort[strip.Count];
+                for (int k = 0; k < strip.Count; k++)
+                    stripIdx[k] = (ushort)(strip.Element(k)!.ReadIntAny("index") ?? 0);
+
+                foreach (var part in parts.Elements())
+                {
+                    long matIdx = part.ReadIntAny("material") ?? 0;
+                    string shaderName = "default";
+                    if (matIdx >= 0 && matIdx < matsBlock.Count)
+                        shaderName = FileStem(matsBlock.Element((int)matIdx)!.ReadTagRefPath("shader") ?? "");
+                    string cellLabel = $"{permName} {regionName}";
+                    int jmsMat = materials.FindIndex(m => m.Name == shaderName && m.MaterialName.EndsWith(cellLabel, StringComparison.Ordinal));
+                    if (jmsMat < 0)
+                    {
+                        int slot = materials.Count + 1;
+                        materials.Add(new JmsMaterial(shaderName, $"({slot}) {cellLabel}"));
+                        jmsMat = materials.Count - 1;
+                    }
+
+                    int start = (int)System.Math.Max(part.ReadIntAny("strip start index") ?? 0, 0);
+                    int len = (int)System.Math.Max(part.ReadIntAny("strip length") ?? 0, 0);
+                    if (start >= stripIdx.Length) continue;
+                    int end = System.Math.Min(start + len, stripIdx.Length);
+                    foreach (var (a, b, c) in Geometry.StripToList(stripIdx.AsSpan(start, end - start)))
+                    {
+                        uint baseIdx = (uint)vertices.Count;
+                        foreach (uint vi in (ReadOnlySpan<uint>)[a, b, c])
+                        {
+                            var v = rawV.Element((int)vi);
+                            if (v is null) continue;
+                            var jv = ReadH2Vertex(v);
+                            // Classification 0/1 = worldspace/rigid: bind the
+                            // section to its single rigid node.
+                            if (classification <= 1)
+                            {
+                                jv.NodeSets.Clear();
+                                jv.NodeSets.Add(((short)System.Math.Max((int)rigidNode, 0), 1.0f));
+                            }
+                            else if (jv.NodeSets.Count == 0 && rigidNode >= 0)
+                            {
+                                jv.NodeSets.Add((rigidNode, 1.0f));
+                            }
+                            vertices.Add(jv);
+                        }
+                        triangles.Add(new JmsTriangle(jmsMat, baseIdx, baseIdx + 1, baseIdx + 2));
+                    }
+                }
+            }
+        }
+        return new JmsFile
+        {
+            Nodes = worldNodes,
+            Materials = materials,
+            Markers = markers,
+            Vertices = vertices,
+            Triangles = triangles,
+        };
+    }
+
+    /// <summary>Read one Halo 2 raw vertex (shared with the ASS exporter).
+    /// Position ×100; normal is <c>real_vector_3d</c>; node influences come
+    /// from the NEW/OLD index arrays paired with the weights array.</summary>
+    internal static JmsVertex ReadH2Vertex(TagStruct v)
+    {
+        var uv = v.ReadPoint2d("texcoord");
+        bool useNew = (v.ReadIntAny("use new node indices") ?? 1) != 0;
+        string idxField = useNew ? "node indices (NEW)" : "node indices (OLD)";
+        string idxElem = useNew ? "node index (NEW)" : "node index (OLD)";
+        var nodeSets = new List<(short, float)>(4);
+        var ia = v.Field(idxField)?.AsArray();
+        var wa = v.Field("node weights")?.AsArray();
+        if (ia is not null && wa is not null)
+        {
+            int n = System.Math.Min(ia.Count, wa.Count);
+            for (int k = 0; k < n; k++)
+            {
+                short idx = (short)(ia.Element(k)?.ReadIntAny(idxElem) ?? -1);
+                float wt = wa.Element(k)?.ReadReal("node_weight") ?? 0f;
+                if (wt > 0f && idx >= 0) nodeSets.Add((idx, wt));
+            }
+        }
+        var p = v.ReadPoint3d("position");
+        return new JmsVertex
+        {
+            Position = p.Mul(Geometry.Scale),
+            Normal = v.ReadVec3("normal"),
+            NodeSets = nodeSets,
+            Uvs = [new RealPoint2d(uv.X, 1.0f - uv.Y)],
+        };
+    }
+
+    //================================================================
+    // Halo CE scenario_structure_bsp → JMS (render + collision)
+    //================================================================
+
+    /// <summary>Reconstruct the render JMS for a Halo CE
+    /// <c>scenario_structure_bsp</c>. Render geometry lives in
+    /// <c>lightmaps[].materials[]</c>: each material has a per-material vertex
+    /// blob (<c>uncompressed vertices</c>) and a <c>(surfaces, surface count)</c>
+    /// range into the global <c>surfaces</c> block. The blob's leading array is
+    /// 56-byte-stride rendered vertices with <b>little-endian</b> floats (even
+    /// though CE's structured fields are big-endian — an MCC quirk).</summary>
+    public static JmsFile FromScenarioStructureBspCe(TagFile tag)
+    {
+        var root = tag.Root;
+        var globalSurfaces = root.FieldPath("surfaces")?.AsBlock() ?? throw Missing("surfaces");
+        var lightmaps = root.FieldPath("lightmaps")?.AsBlock() ?? throw Missing("lightmaps");
+
+        var nodes = new List<JmsNode> { new("frame", -1, new RealQuaternion(0, 0, 0, 1), default) };
+        var materials = new List<JmsMaterial>();
+        var vertices = new List<JmsVertex>();
+        var triangles = new List<JmsTriangle>();
+        const int Stride = 56; // position(3) normal(3) binormal(3) tangent(3) uv(2)
+
+        foreach (var lm in lightmaps.Elements())
+        {
+            var mats = lm.Field("materials")?.AsBlock();
+            if (mats is null) continue;
+            foreach (var material in mats.Elements())
+            {
+                int nverts = (int)(material.Field("rendered vertices")?.AsStruct()?.ReadIntAny("vertex count") ?? 0);
+                long surfStart = material.ReadIntAny("surfaces") ?? 0;
+                long surfCount = material.ReadIntAny("surface count") ?? 0;
+                byte[]? blob = material.Field("uncompressed vertices")?.AsData();
+                if (blob is null || nverts == 0) continue;
+
+                int n = System.Math.Min(nverts, blob.Length / Stride);
+                uint baseIdx = (uint)vertices.Count;
+                for (int v = 0; v < n; v++)
+                {
+                    int o = v * Stride;
+                    float F(int k) => BinaryPrimitives.ReadSingleLittleEndian(blob.AsSpan(o + k * 4, 4));
+                    vertices.Add(new JmsVertex
+                    {
+                        Position = new RealPoint3d(F(0) * Geometry.Scale, F(1) * Geometry.Scale, F(2) * Geometry.Scale),
+                        Normal = new RealVector3d(F(3), F(4), F(5)),
+                        NodeSets = new() { ((short)0, 1.0f) },
+                        Uvs = new() { new RealPoint2d(F(12), F(13)) },
+                    });
+                }
+
+                string shaderName = Basename(material.ReadTagRefPath("shader") ?? "");
+                if (string.IsNullOrEmpty(shaderName)) shaderName = "default";
+                int jmsIdx = materials.FindIndex(m => m.Name == shaderName);
+                if (jmsIdx < 0)
+                {
+                    int slot = materials.Count + 1;
+                    materials.Add(new JmsMaterial(shaderName, $"({slot}) {shaderName}"));
+                    jmsIdx = materials.Count - 1;
+                }
+
+                for (long si = surfStart; si < surfStart + surfCount; si++)
+                {
+                    if (si < 0 || si >= globalSurfaces.Count) continue;
+                    var s = globalSurfaces.Element((int)si)!;
+                    long v0 = s.ReadIntAny("vertex0 index") ?? -1;
+                    long v1 = s.ReadIntAny("vertex1 index") ?? -1;
+                    long v2 = s.ReadIntAny("vertex2 index") ?? -1;
+                    if (v0 < 0 || v1 < 0 || v2 < 0 || v0 >= n || v1 >= n || v2 >= n) continue;
+                    triangles.Add(new JmsTriangle(jmsIdx, baseIdx + (uint)v0, baseIdx + (uint)v1, baseIdx + (uint)v2));
+                }
+            }
+        }
+        return new JmsFile { Nodes = nodes, Materials = materials, Vertices = vertices, Triangles = triangles };
+    }
+
+    /// <summary>Reconstruct the collision JMS for a Halo CE
+    /// <c>scenario_structure_bsp</c>: the <c>collision bsp</c> block (same
+    /// edge-ring shape as model collision), materials from <c>collision
+    /// materials</c> shader tag-refs, vertices already world-space.</summary>
+    public static JmsFile FromScenarioStructureBspCeCollision(TagFile tag)
+    {
+        var root = tag.Root;
+        var materialsBlock = root.FieldPath("collision materials")?.AsBlock() ?? throw Missing("collision materials");
+        var collBsps = root.FieldPath("collision bsp")?.AsBlock() ?? throw Missing("collision bsp");
+
+        var nodes = new List<JmsNode> { new("frame", -1, new RealQuaternion(0, 0, 0, 1), default) };
+        var materials = new List<JmsMaterial>();
+        var vertices = new List<JmsVertex>();
+        var triangles = new List<JmsTriangle>();
+
+        foreach (var bsp in collBsps.Elements())
+        {
+            var surfaces = bsp.Field("surfaces")?.AsBlock();
+            var edges = bsp.Field("edges")?.AsBlock();
+            var bspVerts = bsp.Field("vertices")?.AsBlock();
+            if (surfaces is null || edges is null || bspVerts is null) continue;
+            EmitCollisionBsp(surfaces, edges, bspVerts, 0, null, materialsBlock, "collision", materials, vertices, triangles);
+        }
+        return new JmsFile { Nodes = nodes, Materials = materials, Vertices = vertices, Triangles = triangles };
     }
 
     //================================================================
@@ -114,68 +478,133 @@ public sealed class JmsFile
                         if (boneXform.TryGetValue(nodes[nodeIdx].Name, out var bw)) boneWorld = bw;
                     }
 
-                    var edgeCache = new List<Geometry.EdgeRow>(edges.Count);
-                    for (int k = 0; k < edges.Count; k++)
-                    {
-                        var e = edges.Element(k)!;
-                        edgeCache.Add(new Geometry.EdgeRow(
-                            (int)(e.ReadIntAny("start vertex") ?? -1),
-                            (int)(e.ReadIntAny("end vertex") ?? -1),
-                            (int)(e.ReadIntAny("forward edge") ?? -1),
-                            (int)(e.ReadIntAny("reverse edge") ?? -1),
-                            (int)(e.ReadIntAny("left surface") ?? -1),
-                            (int)(e.ReadIntAny("right surface") ?? -1)));
-                    }
-
-                    var vertPoints = new RealPoint3d[bspVerts.Count];
-                    for (int k = 0; k < bspVerts.Count; k++)
-                    {
-                        var local = bspVerts.Element(k)!.ReadPoint3d("point").Mul(Geometry.Scale);
-                        vertPoints[k] = boneWorld is { } bw
-                            ? bw.Trans.Add(bw.Rot.Rotate(local.AsVector()))
-                            : local;
-                    }
-
-                    for (int si = 0; si < surfaces.Count; si++)
-                    {
-                        var surface = surfaces.Element(si)!;
-                        int firstEdge = (int)(surface.ReadIntAny("first edge") ?? -1);
-                        if (firstEdge < 0) continue;
-                        int surfaceMaterial = (int)(surface.ReadIntAny("material") ?? -1);
-
-                        var polygon = Geometry.WalkSurfaceRing(si, firstEdge, edgeCache);
-                        if (polygon.Count < 3) continue;
-
-                        string shaderName = surfaceMaterial >= 0 && surfaceMaterial < materialsBlock.Count
-                            ? (materialsBlock.Element(surfaceMaterial)!.ReadStringId("name") ?? "")
-                            : "default";
-                        string cellLabel = $"{permName} {regionName}";
-                        int jmsIdx = FindOrAddMaterial(materials, shaderName, cellLabel);
-
-                        void EmitVert(int vi)
-                        {
-                            var pos = vi >= 0 && vi < vertPoints.Length ? vertPoints[vi] : default;
-                            vertices.Add(new JmsVertex
-                            {
-                                Position = pos,
-                                Normal = new RealVector3d(0, 0, 1),
-                                NodeSets = new() { (nodeIdx, 1.0f) },
-                                Uvs = new() { new RealPoint2d(0, 0) },
-                            });
-                        }
-                        for (int k = 1; k < polygon.Count - 1; k++)
-                        {
-                            int a = polygon[0], b = polygon[k], c = polygon[k + 1];
-                            uint baseIdx = (uint)vertices.Count;
-                            EmitVert(a); EmitVert(b); EmitVert(c);
-                            triangles.Add(new JmsTriangle(jmsIdx, baseIdx, baseIdx + 1, baseIdx + 2));
-                        }
-                    }
+                    EmitCollisionBsp(surfaces, edges, bspVerts, nodeIdx, boneWorld,
+                        materialsBlock, $"{permName} {regionName}", materials, vertices, triangles);
                 }
             }
         }
 
         return new JmsFile { Nodes = nodes, Materials = materials, Vertices = vertices, Triangles = triangles };
+    }
+
+    /// <summary>Walk a parsed Halo CE <c>model_collision_geometry</c> tag.
+    /// CE stores collision BSPs per-node (<c>nodes[i]/bsps[j]</c>) with the
+    /// surface/edge/vertex blocks directly inside each <c>bsps</c> element —
+    /// no region/permutation/<c>bsp</c>-wrapper nesting, and vertices are
+    /// already node-local (no skeleton composition).</summary>
+    public static JmsFile FromModelCollisionGeometry(TagFile tag)
+    {
+        var root = tag.Root;
+        List<JmsNode> nodes;
+        try { nodes = ReadNodes(root); }
+        catch { nodes = ReadPhmoNodes(root); }
+        var materialsBlock = root.FieldPath("materials")?.AsBlock() ?? throw Missing("materials");
+        var nodesBlock = root.FieldPath("nodes")?.AsBlock() ?? throw Missing("nodes");
+
+        var materials = new List<JmsMaterial>();
+        var vertices = new List<JmsVertex>();
+        var triangles = new List<JmsTriangle>();
+
+        for (int ni = 0; ni < nodesBlock.Count; ni++)
+        {
+            var node = nodesBlock.Element(ni)!;
+            string nodeName = node.ReadString("name") ?? "";
+            var bsps = node.Field("bsps")?.AsBlock();
+            if (bsps is null) continue;
+            foreach (var bsp in bsps.Elements())
+            {
+                var surfaces = bsp.Field("surfaces")?.AsBlock();
+                var edges = bsp.Field("edges")?.AsBlock();
+                var bspVerts = bsp.Field("vertices")?.AsBlock();
+                if (surfaces is null || edges is null || bspVerts is null) continue;
+                EmitCollisionBsp(surfaces, edges, bspVerts, (short)ni, null,
+                    materialsBlock, nodeName, materials, vertices, triangles);
+            }
+        }
+        return new JmsFile { Nodes = nodes, Materials = materials, Vertices = vertices, Triangles = triangles };
+    }
+
+    /// <summary>Emit triangles for one collision BSP (a surfaces/edges/vertices
+    /// triple) into the shared accumulators. Shared by the H2/H3
+    /// <c>collision_model</c> walker and the CE <c>model_collision_geometry</c>
+    /// walker; readers accept either form (point-vs-vector vertices,
+    /// string-id-vs-string material names).</summary>
+    private static void EmitCollisionBsp(
+        TagBlock surfaces, TagBlock edges, TagBlock bspVerts, short nodeIdx,
+        (RealQuaternion Rot, RealPoint3d Trans)? boneWorld, TagBlock materialsBlock,
+        string cellLabel, List<JmsMaterial> materials, List<JmsVertex> vertices, List<JmsTriangle> triangles)
+    {
+        var edgeCache = new List<Geometry.EdgeRow>(edges.Count);
+        for (int k = 0; k < edges.Count; k++)
+        {
+            var e = edges.Element(k)!;
+            edgeCache.Add(new Geometry.EdgeRow(
+                (int)(e.ReadIntAny("start vertex") ?? -1),
+                (int)(e.ReadIntAny("end vertex") ?? -1),
+                (int)(e.ReadIntAny("forward edge") ?? -1),
+                (int)(e.ReadIntAny("reverse edge") ?? -1),
+                (int)(e.ReadIntAny("left surface") ?? -1),
+                (int)(e.ReadIntAny("right surface") ?? -1)));
+        }
+
+        // CE stores `point` as real_vector_3d, H2/H3 as real_point_3d.
+        var vertPoints = new RealPoint3d[bspVerts.Count];
+        for (int k = 0; k < bspVerts.Count; k++)
+        {
+            var local = bspVerts.Element(k)!.ReadPointOrVec("point").Mul(Geometry.Scale);
+            vertPoints[k] = boneWorld is { } bw
+                ? bw.Trans.Add(bw.Rot.Rotate(local.AsVector()))
+                : local;
+        }
+
+        for (int si = 0; si < surfaces.Count; si++)
+        {
+            var surface = surfaces.Element(si)!;
+            int firstEdge = (int)(surface.ReadIntAny("first edge") ?? -1);
+            if (firstEdge < 0) continue;
+            int surfaceMaterial = (int)(surface.ReadIntAny("material") ?? -1);
+
+            var polygon = Geometry.WalkSurfaceRing(si, firstEdge, edgeCache);
+            if (polygon.Count < 3) continue;
+
+            // collision_model materials carry a `name` (string-id or inline
+            // string); structure-BSP collision materials carry a `shader`
+            // tag_reference — use its basename.
+            string shaderName = "default";
+            if (surfaceMaterial >= 0 && surfaceMaterial < materialsBlock.Count)
+            {
+                var m = materialsBlock.Element(surfaceMaterial)!;
+                shaderName = m.ReadString("name") ?? Basename(m.ReadTagRefPath("shader") ?? "");
+            }
+            int jmsIdx = FindOrAddMaterial(materials, shaderName, cellLabel);
+
+            void EmitVert(int vi)
+            {
+                var pos = vi >= 0 && vi < vertPoints.Length ? vertPoints[vi] : default;
+                vertices.Add(new JmsVertex
+                {
+                    Position = pos,
+                    Normal = new RealVector3d(0, 0, 1),
+                    NodeSets = new() { (nodeIdx, 1.0f) },
+                    Uvs = new() { new RealPoint2d(0, 0) },
+                });
+            }
+            for (int k = 1; k < polygon.Count - 1; k++)
+            {
+                int a = polygon[0], b = polygon[k], c = polygon[k + 1];
+                uint baseIdx = (uint)vertices.Count;
+                EmitVert(a); EmitVert(b); EmitVert(c);
+                triangles.Add(new JmsTriangle(jmsIdx, baseIdx, baseIdx + 1, baseIdx + 2));
+            }
+        }
+    }
+
+    /// <summary>Last <c>\</c>/<c>/</c>-separated path component (keeps the
+    /// extension, unlike <see cref="FileStem"/>).</summary>
+    private static string Basename(string path)
+    {
+        int i = path.LastIndexOfAny(['\\', '/']);
+        return i >= 0 ? path[(i + 1)..] : path;
     }
 
     //================================================================
@@ -224,6 +653,173 @@ public sealed class JmsFile
     }
 
     //================================================================
+    // physics_model (Halo 2 — flat shapes, raw-byte shape parenting)
+    //================================================================
+
+    public static JmsFile FromPhysicsModelH2(TagFile tag) => BuildPhysicsModelH2(tag, null);
+
+    public static JmsFile FromPhysicsModelH2WithSkeleton(TagFile tag, IReadOnlyList<JmsNode> skeleton) =>
+        BuildPhysicsModelH2(tag, skeleton);
+
+    private static JmsFile BuildPhysicsModelH2(TagFile tag, IReadOnlyList<JmsNode>? skeleton)
+    {
+        var root = tag.Root;
+        var nodes = ReadPhmoNodes(root);
+        if (skeleton is not null)
+        {
+            var byName = new Dictionary<string, JmsNode>();
+            foreach (var n in skeleton) byName[n.Name] = n;
+            for (int i = 0; i < nodes.Count; i++)
+                if (byName.TryGetValue(nodes[i].Name, out var src))
+                    nodes[i] = nodes[i] with { Rotation = src.Rotation, Translation = src.Translation };
+        }
+        var materials = ReadPhmoMaterials(root);
+        var (parentMap, defaultNode) = BuildH2ShapeParentMap(root);
+        var nameToNode = new Dictionary<string, int>();
+        for (int i = 0; i < nodes.Count; i++) nameToNode[nodes[i].Name] = i;
+
+        var spheres = ReadPhmoH2Spheres(root, parentMap, nameToNode, defaultNode);
+        var boxes = ReadPhmoH2Boxes(root, parentMap, nameToNode, defaultNode);
+        var capsules = ReadPhmoH2Pills(root, parentMap, nameToNode, defaultNode);
+        var convex = ReadPhmoH2Polyhedra(root, parentMap, nameToNode, defaultNode);
+        var ragdolls = ReadPhmoRagdolls(root);
+        var hinges = ReadPhmoHinges(root, false);
+        hinges.AddRange(ReadPhmoHinges(root, true));
+        return new JmsFile
+        {
+            Nodes = nodes, Materials = materials, Spheres = spheres, Boxes = boxes,
+            Capsules = capsules, ConvexShapes = convex, Ragdolls = ragdolls, Hinges = hinges,
+        };
+    }
+
+    /// <summary>Each H2 rigid_body carries node + a (shape_type, shape_index)
+    /// reference. The generated def leaves that 4-byte ref as an unnamed
+    /// pointer, so read it from the element bytes (shape_type @ +56,
+    /// shape_index @ +58 in the v1/144-byte rigid body). Map (type,index)→node;
+    /// the single-node case gives a default for unreferenced shapes.</summary>
+    private static (Dictionary<(long, long), int> Map, int DefaultNode) BuildH2ShapeParentMap(TagStruct root)
+    {
+        var map = new Dictionary<(long, long), int>();
+        var rbs = root.FieldPath("rigid bodies")?.AsBlock();
+        if (rbs is null) return (map, -1);
+        var nodesSeen = new HashSet<int>();
+        foreach (var rb in rbs.Elements())
+        {
+            int node = (int)(rb.ReadIntAny("node") ?? -1);
+            nodesSeen.Add(node);
+            var raw = rb.RawSpan;
+            if (raw.Length < 60) continue;
+            long shapeType = BinaryPrimitives.ReadInt16LittleEndian(raw.Slice(56, 2));
+            long shapeIndex = BinaryPrimitives.ReadInt16LittleEndian(raw.Slice(58, 2));
+            if (shapeIndex >= 0) map[(shapeType, shapeIndex)] = node;
+        }
+        int defaultNode = nodesSeen.Count == 1 ? nodesSeen.First() : -1;
+        return (map, defaultNode);
+    }
+
+    private static (string Name, int Parent) H2ShapeParent(TagStruct s, long shapeType, int index,
+        Dictionary<(long, long), int> parentMap, Dictionary<string, int> nameToNode, int defaultNode)
+    {
+        string name = s.ReadStringId("name") ?? "";
+        int parent = parentMap.TryGetValue((shapeType, index), out int p) ? p
+            : nameToNode.TryGetValue(name, out int n) ? n
+            : defaultNode;
+        return (name, parent);
+    }
+
+    private static List<JmsSphere> ReadPhmoH2Spheres(TagStruct root, Dictionary<(long, long), int> pm, Dictionary<string, int> n2n, int dflt)
+    {
+        var block = root.FieldPath("spheres")?.AsBlock();
+        if (block is null) return new();
+        var outList = new List<JmsSphere>(block.Count);
+        for (int i = 0; i < block.Count; i++)
+        {
+            var s = block.Element(i)!;
+            var (name, parent) = H2ShapeParent(s, ShapeSphere, i, pm, n2n, dflt);
+            outList.Add(new JmsSphere(name, parent, (int)(s.ReadIntAny("material") ?? 0),
+                RotationFromBasis(s), s.ReadVec3("translation").AsPoint().Mul(Geometry.Scale),
+                (s.ReadReal("radius") ?? 0f) * Geometry.Scale));
+        }
+        return outList;
+    }
+
+    private static List<JmsBox> ReadPhmoH2Boxes(TagStruct root, Dictionary<(long, long), int> pm, Dictionary<string, int> n2n, int dflt)
+    {
+        var block = root.FieldPath("boxes")?.AsBlock();
+        if (block is null) return new();
+        var outList = new List<JmsBox>(block.Count);
+        for (int i = 0; i < block.Count; i++)
+        {
+            var b = block.Element(i)!;
+            var (name, parent) = H2ShapeParent(b, ShapeBox, i, pm, n2n, dflt);
+            var half = b.ReadVec3("half extents");
+            float cr = b.ReadReal("radius") ?? 0f;
+            outList.Add(new JmsBox(name, parent, (int)(b.ReadIntAny("material") ?? 0),
+                RotationFromBasis(b), b.ReadVec3("translation").AsPoint().Mul(Geometry.Scale),
+                (half.I + cr) * 2f * Geometry.Scale, (half.J + cr) * 2f * Geometry.Scale, (half.K + cr) * 2f * Geometry.Scale));
+        }
+        return outList;
+    }
+
+    private static List<JmsCapsule> ReadPhmoH2Pills(TagStruct root, Dictionary<(long, long), int> pm, Dictionary<string, int> n2n, int dflt)
+    {
+        var block = root.FieldPath("pills")?.AsBlock();
+        if (block is null) return new();
+        var outList = new List<JmsCapsule>(block.Count);
+        for (int i = 0; i < block.Count; i++)
+        {
+            var p = block.Element(i)!;
+            var (name, parent) = H2ShapeParent(p, ShapePill, i, pm, n2n, dflt);
+            float radius = p.ReadReal("radius") ?? 0f;
+            var bottom = p.ReadVec3("bottom");
+            var top = p.ReadVec3("top");
+            var dir = bottom.Sub(top);
+            var anchor = bottom.Add(dir.Normalized().Mul(radius));
+            float height = top.Sub(bottom).Length() * Geometry.Scale;
+            var rot = MathExtensions.ShortestArc(new RealVector3d(0, 0, -1), top.Sub(bottom));
+            outList.Add(new JmsCapsule(name, parent, (int)(p.ReadIntAny("material") ?? 0),
+                rot, anchor.AsPoint().Mul(Geometry.Scale), height, radius * Geometry.Scale));
+        }
+        return outList;
+    }
+
+    private static List<JmsConvex> ReadPhmoH2Polyhedra(TagStruct root, Dictionary<(long, long), int> pm, Dictionary<string, int> n2n, int dflt)
+    {
+        var block = root.FieldPath("polyhedra")?.AsBlock();
+        if (block is null) return new();
+        var fourVectors = root.FieldPath("polyhedron four vectors")?.AsBlock();
+        var outList = new List<JmsConvex>(block.Count);
+        int fvOffset = 0;
+        for (int i = 0; i < block.Count; i++)
+        {
+            var p = block.Element(i)!;
+            var (name, parent) = H2ShapeParent(p, ShapePolyhedron, i, pm, n2n, dflt);
+            int fvSize = (int)System.Math.Max(p.ReadIntAny("four vectors size") ?? 0, 0);
+            var verts = new List<RealPoint3d>();
+            if (fourVectors is not null)
+            {
+                for (int k = 0; k < fvSize; k++)
+                {
+                    var fv = fourVectors.Element(fvOffset + k);
+                    if (fv is null) continue;
+                    var xv = fv.ReadVec3("four vectors x");
+                    var yv = fv.ReadVec3("four vectors y");
+                    var zv = fv.ReadVec3("four vectors z");
+                    verts.Add(new RealPoint3d(xv.I, yv.I, zv.I).Mul(Geometry.Scale));
+                    verts.Add(new RealPoint3d(xv.J, yv.J, zv.J).Mul(Geometry.Scale));
+                    verts.Add(new RealPoint3d(xv.K, yv.K, zv.K).Mul(Geometry.Scale));
+                }
+            }
+            var seen = new HashSet<(int, int, int)>();
+            verts = verts.Where(v => seen.Add((BitConverter.SingleToInt32Bits(v.X), BitConverter.SingleToInt32Bits(v.Y), BitConverter.SingleToInt32Bits(v.Z)))).ToList();
+            outList.Add(new JmsConvex(name, parent, (int)(p.ReadIntAny("material") ?? 0),
+                new RealQuaternion(0, 0, 0, 1), default, verts));
+            fvOffset += fvSize;
+        }
+        return outList;
+    }
+
+    //================================================================
     // node / material / marker / geometry walkers (render_model)
     //================================================================
 
@@ -235,10 +831,10 @@ public sealed class JmsFile
         {
             var n = block.Element(i)!;
             outList.Add(new JmsNode(
-                n.ReadStringId("name") ?? "",
+                n.ReadString("name") ?? "",
                 n.ReadBlockIndex("parent node"),
                 n.ReadQuat("default rotation"),
-                n.ReadPoint3d("default translation").Mul(Geometry.Scale)));
+                n.ReadPointOrVec("default translation").Mul(Geometry.Scale)));
         }
         return outList;
     }
@@ -886,36 +1482,49 @@ public sealed class JmsFile
     // 8213 text writer
     //================================================================
 
-    /// <summary>Write the JMS as version-8213 text into <paramref name="w"/>.
-    /// Newlines are LF and floats are fixed 10-place — matching the Rust
-    /// writer byte-for-byte.</summary>
-    public void Write(Stream stream)
+    /// <summary>Write the JMS as text at the given format <paramref name="version"/>
+    /// (8200 Halo CE / 8210 Halo 2 / 8213 Halo 3+ — use
+    /// <see cref="GameExtensions.JmsVersion"/>). Newlines are LF and floats are
+    /// fixed 10-place, matching the Rust writer byte-for-byte.</summary>
+    public void Write(Stream stream, int version = 8213)
     {
         using var w = new StreamWriter(stream, new System.Text.UTF8Encoding(false), 1 << 16, leaveOpen: true)
         {
             NewLine = "\n",
             AutoFlush = false,
         };
-        Write(w);
+        Write(w, version);
         w.Flush();
     }
 
     /// <summary>Render the full JMS text to a string (LF newlines).</summary>
-    public string ToText()
+    public string ToText(int version = 8213)
     {
         var sb = new System.Text.StringBuilder();
         using var w = new StringWriter(sb) { NewLine = "\n" };
-        Write(w);
+        Write(w, version);
         return sb.ToString();
     }
 
-    private void Write(TextWriter w)
+    private void Write(TextWriter w, int version)
     {
+        // The old (Halo CE, <= 8200) format is structurally different — a
+        // bare value stream with no comment scaffolding, child/sibling node
+        // links, name+texture materials, a REGIONS section, two-influence
+        // vertices, and per-triangle region indices.
+        if (version <= 8200)
+        {
+            WriteOld(w, version);
+            return;
+        }
+        // 8211+ carries a trailing vertex-color triple; 8213 adds SKYLIGHT.
+        bool hasVertexColor = version >= 8211;
+
         void L(string s) { w.Write(s); w.Write('\n'); }
         void Blank() => w.Write('\n');
 
         L(";### VERSION ###");
-        L("8213");
+        L(I(version));
         Blank();
 
         L(";### NODES ###");
@@ -994,8 +1603,11 @@ public sealed class JmsFile
         L(";\t<texture coordinate count>");
         L(";\t\t<texture coordinates <u,v>>");
         L(";\t\t<...>");
-        L(";\t\t<vertex color <r,g,b>>");
-        L(";\t\t<...>");
+        if (hasVertexColor)
+        {
+            L(";\t\t<vertex color <r,g,b>>");
+            L(";\t\t<...>");
+        }
         Blank();
         for (int i = 0; i < Vertices.Count; i++)
         {
@@ -1011,7 +1623,8 @@ public sealed class JmsFile
             }
             L(I(v.Uvs.Count));
             foreach (var uv in v.Uvs) WriteFloats(w, uv.ToArray());
-            WriteFloats(w, [0.0f, 0.0f, 0.0f]); // vertex color always zero per TagTool
+            if (hasVertexColor)
+                WriteFloats(w, [0.0f, 0.0f, 0.0f]); // vertex color always zero per TagTool
             Blank();
         }
 
@@ -1105,9 +1718,13 @@ public sealed class JmsFile
             Blank();
         }
 
+        // The ragdoll `<friction limit>` (max friction torque) is a Halo 3
+        // (8213) addition — the 8210 (Halo 2) ragdoll format omits it.
+        bool ragdollHasFriction = version >= 8213;
         L(";### RAGDOLLS ###");
         L(I(Ragdolls.Count));
-        foreach (var h in new[] { "<name>", "<attached index>", "<referenced index>", "<attached transform>", "<reference transform>", "<min twist>", "<max twist>", "<min cone>", "<max cone>", "<min plane>", "<max plane>", "<friction limit>" })
+        string[] ragdollHelps = ["<name>", "<attached index>", "<referenced index>", "<attached transform>", "<reference transform>", "<min twist>", "<max twist>", "<min cone>", "<max cone>", "<min plane>", "<max plane>", "<friction limit>"];
+        foreach (var h in ragdollHasFriction ? ragdollHelps : ragdollHelps[..^1])
             L($";\t{h}");
         Blank();
         for (int i = 0; i < Ragdolls.Count; i++)
@@ -1127,7 +1744,8 @@ public sealed class JmsFile
             WriteFloats(w, [r.MaxCone]);
             WriteFloats(w, [r.MinPlane]);
             WriteFloats(w, [r.MaxPlane]);
-            WriteFloats(w, [r.FrictionLimit]);
+            if (ragdollHasFriction)
+                WriteFloats(w, [r.FrictionLimit]);
             Blank();
         }
 
@@ -1156,12 +1774,107 @@ public sealed class JmsFile
 
         foreach (var (name, helps) in EmptySectionsTrailing)
         {
+            // SKYLIGHT is a Halo 3 (8213) addition — omit it for older versions.
+            if (name == "SKYLIGHT" && version < 8213)
+                continue;
             L($";### {name} ###");
             L("0");
             foreach (var h in helps) L($";\t{h}");
             Blank();
         }
         Blank();
+    }
+
+    /// <summary>Old (Halo CE, &lt;= 8200) bare JMS: no comment scaffolding,
+    /// child/sibling node links, name+texture materials, a REGIONS section,
+    /// two-influence vertices, and per-triangle region indices.</summary>
+    private void WriteOld(TextWriter w, int version)
+    {
+        void L(string s) { w.Write(s); w.Write('\n'); }
+
+        L(I(version));
+        L("0"); // node list checksum (unused by importers)
+
+        var (children, siblings) = DeriveChildSibling(Nodes);
+        L(I(Nodes.Count));
+        for (int i = 0; i < Nodes.Count; i++)
+        {
+            var n = Nodes[i];
+            L(n.Name);
+            L(I(children[i]));
+            L(I(siblings[i]));
+            WriteFloats(w, n.Rotation.ToArray());
+            WriteFloats(w, n.Translation.ToArray());
+        }
+
+        L(I(Materials.Count));
+        foreach (var m in Materials)
+        {
+            L(m.Name);
+            L(m.MaterialName); // 8197 "texture path" slot
+        }
+
+        L(I(Markers.Count));
+        foreach (var m in Markers)
+        {
+            L(m.Name);
+            L("-1"); // region (markers aren't region-scoped here)
+            L(I(m.NodeIndex));
+            WriteFloats(w, m.Rotation.ToArray());
+            WriteFloats(w, m.Translation.ToArray());
+            WriteFloats(w, [m.Radius]);
+        }
+
+        L(I(Regions.Count));
+        foreach (var r in Regions)
+            L(r);
+
+        L(I(Vertices.Count));
+        foreach (var v in Vertices)
+        {
+            var n0 = v.NodeSets.Count > 0 ? v.NodeSets[0] : ((short)-1, 0f);
+            var n1 = v.NodeSets.Count > 1 ? v.NodeSets[1] : ((short)-1, 0f);
+            L(I(n0.Item1));
+            WriteFloats(w, v.Position.ToArray());
+            WriteFloats(w, v.Normal.ToArray());
+            L(I(n1.Item1));
+            WriteFloats(w, [n1.Item2]);
+            var uv = v.Uvs.Count > 0 ? v.Uvs[0].ToArray() : [0f, 0f];
+            WriteFloats(w, uv);
+            L("0"); // unused flag
+        }
+
+        L(I(Triangles.Count));
+        foreach (var t in Triangles)
+        {
+            L(I(t.Region));
+            L(I(t.Material));
+            L($"{t.V0}\t{t.V1}\t{t.V2}");
+        }
+    }
+
+    /// <summary>Derive per-node first-child / next-sibling indices from the
+    /// parent links, for the old (8200) node format (which stores child/sibling
+    /// rather than parent). Mirrors Rust's <c>derive_child_sibling</c>.</summary>
+    private static (int[] Children, int[] Siblings) DeriveChildSibling(IReadOnlyList<JmsNode> nodes)
+    {
+        int n = nodes.Count;
+        var children = new int[n];
+        var siblings = new int[n];
+        Array.Fill(children, -1);
+        Array.Fill(siblings, -1);
+        // First child: lowest-index node whose parent is i.
+        // Next sibling: next node sharing the same parent.
+        for (int i = n - 1; i >= 0; i--)
+        {
+            int parent = nodes[i].Parent;
+            if (parent >= 0 && parent < n)
+            {
+                siblings[i] = children[parent];
+                children[parent] = i;
+            }
+        }
+        return (children, siblings);
     }
 
     private static string I(long v) => v.ToString(CultureInfo.InvariantCulture);
@@ -1209,7 +1922,12 @@ public sealed class JmsVertex
 }
 
 /// <summary>JMS triangle: material slot + three vertex indices.</summary>
-public readonly record struct JmsTriangle(int Material, uint V0, uint V1, uint V2);
+public readonly record struct JmsTriangle(int Material, uint V0, uint V1, uint V2)
+{
+    /// <summary>Region index — written only by the old (Halo CE, 8200) JMS
+    /// format's per-triangle region field. 0 (unused) for gen3.</summary>
+    public int Region { get; init; }
+}
 
 public readonly record struct JmsSphere(string Name, int Parent, int Material, RealQuaternion Rotation, RealPoint3d Translation, float Radius);
 

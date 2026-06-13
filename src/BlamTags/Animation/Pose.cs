@@ -30,6 +30,27 @@ public sealed class Skeleton
             }
             return new Skeleton { Nodes = nodes };
         }
+        // Halo CE `model_animations` (antr): the skeleton is a root-level
+        // `nodes` block whose fields drop the `index` suffix (`first child
+        // node` / `next sibling node` / `parent node`) and store the name
+        // as an inline string rather than a string-id.
+        var ceBlock = root.FieldPath("nodes")?.AsBlock();
+        if (ceBlock is not null)
+        {
+            var nodes = new List<SkeletonNode>(ceBlock.Count);
+            for (int i = 0; i < ceBlock.Count; i++)
+            {
+                var elem = ceBlock.Element(i);
+                if (elem is null) continue;
+                short Idx(string n) => (short)(elem.ReadIntAny(n) ?? -1);
+                nodes.Add(new SkeletonNode(
+                    elem.ReadString("name") ?? elem.ReadStringId("name") ?? "",
+                    Idx("first child node"),
+                    Idx("next sibling node"),
+                    Idx("parent node")));
+            }
+            return new Skeleton { Nodes = nodes };
+        }
         return new Skeleton();
     }
 
@@ -52,10 +73,144 @@ public struct NodeTransform
     };
 }
 
+/// <summary>One <c>object-space parent nodes</c> entry — a node whose
+/// object-space orientation is pinned to a fixed transform (Reach/H4 3D
+/// pose overlays, and some H2 replacement anims). Port of the Rust
+/// <c>ObjectSpaceParentNode</c>.</summary>
+public readonly record struct ObjectSpaceParentNode(
+    short NodeIndex, RealPoint3d Translation, RealQuaternion Rotation, float Scale);
+
 /// <summary>Per-frame, per-bone transform table — <c>Frames[frame][bone]</c>.</summary>
 public sealed class Pose
 {
     public List<List<NodeTransform>> Frames { get; init; } = new();
+
+    /// <summary>Apply object-space parent-node corrections to this pose's
+    /// frames and the leading <paramref name="reference"/> frame —
+    /// Foundry's <c>_apply_object_space_base_corrections</c>, used for
+    /// Reach/H4 3D pose overlays and H2 replacement anims. No-op when
+    /// <paramref name="targets"/> is empty. Port of the Rust
+    /// <c>Pose::apply_object_space_corrections</c>.</summary>
+    public void ApplyObjectSpaceCorrections(
+        List<NodeTransform> reference, Skeleton skeleton,
+        IReadOnlyList<NodeTransform> @base, IReadOnlyList<ObjectSpaceParentNode> targets)
+    {
+        if (targets.Count == 0) return;
+        int n = skeleton.Count;
+
+        // (target_index, desired object-space matrix), shallow-to-deep.
+        var corrections = new List<(int Index, Matrix4 Matrix)>();
+        foreach (var t in targets)
+        {
+            if (t.NodeIndex < 0 || t.NodeIndex >= n) continue;
+            int targetIndex = ObjectSpaceTargetIndex(t.NodeIndex, skeleton);
+            corrections.Add((targetIndex, Matrix4.FromLocRotScale(t.Translation, t.Rotation, t.Scale)));
+        }
+        corrections.Sort((x, y) => NodeDepth(x.Index, skeleton).CompareTo(NodeDepth(y.Index, skeleton)));
+
+        // Running base copy used to derive each target's delta (Foundry's
+        // `reference_frame`) — corrected in lock-step so compounding matches.
+        var correctionRef = new List<NodeTransform>(@base);
+        while (correctionRef.Count < n) correctionRef.Add(NodeTransform.Identity);
+
+        foreach (var (targetIndex, targetMatrix) in corrections)
+        {
+            var os = FrameObjectSpaceMatrices(correctionRef, skeleton);
+            var delta = targetMatrix * os[targetIndex].Inverse();
+            var descendants = DescendantIndices(targetIndex, skeleton);
+
+            ApplyDeltaToFrame(correctionRef, skeleton, descendants, delta);
+            ApplyDeltaToFrame(reference, skeleton, descendants, delta);
+            foreach (var frame in Frames)
+                ApplyDeltaToFrame(frame, skeleton, descendants, delta);
+        }
+    }
+
+    // The node an object-space parent entry actually re-orients: the
+    // targeted node's parent, or the node itself when it is a root.
+    private static int ObjectSpaceTargetIndex(int nodeIndex, Skeleton skeleton)
+    {
+        int parent = skeleton.Nodes[nodeIndex].Parent;
+        return parent < 0 || parent >= skeleton.Count ? nodeIndex : parent;
+    }
+
+    // Depth of `idx` in the hierarchy (root = 1).
+    private static int NodeDepth(int idx, Skeleton skeleton)
+    {
+        int n = skeleton.Count, depth = 0, guard = 0;
+        while (idx >= 0 && idx < n)
+        {
+            depth++;
+            int parent = skeleton.Nodes[idx].Parent;
+            if (parent < 0 || parent >= n || parent == idx) break;
+            idx = parent;
+            if (++guard > n) break;
+        }
+        return depth;
+    }
+
+    // All nodes whose parent-chain reaches `target` (including `target`),
+    // shallow-to-deep.
+    private static List<int> DescendantIndices(int target, Skeleton skeleton)
+    {
+        int n = skeleton.Count;
+        var outList = new List<int>();
+        for (int node = 0; node < n; node++)
+        {
+            int cur = node, guard = 0;
+            while (true)
+            {
+                if (cur == target) { outList.Add(node); break; }
+                int parent = skeleton.Nodes[cur].Parent;
+                if (parent < 0 || parent >= n || parent == cur) break;
+                cur = parent;
+                if (++guard > n) break;
+            }
+        }
+        outList.Sort((a, b) => NodeDepth(a, skeleton).CompareTo(NodeDepth(b, skeleton)));
+        return outList;
+    }
+
+    // Forward-kinematic object-space matrix per bone: os[node] = os[parent] * local(node).
+    private static Matrix4[] FrameObjectSpaceMatrices(IReadOnlyList<NodeTransform> frame, Skeleton skeleton)
+    {
+        int n = skeleton.Count;
+        var os = new Matrix4?[n];
+        for (int i = 0; i < n; i++) ResolveOs(i, frame, skeleton, os);
+        var result = new Matrix4[n];
+        for (int i = 0; i < n; i++) result[i] = os[i] ?? Matrix4.Identity;
+        return result;
+    }
+
+    private static Matrix4 ResolveOs(int i, IReadOnlyList<NodeTransform> frame, Skeleton skeleton, Matrix4?[] os)
+    {
+        if (os[i] is { } cached) return cached;
+        var t = i < frame.Count ? frame[i] : NodeTransform.Identity;
+        var local = Matrix4.FromLocRotScale(t.Translation, t.Rotation, t.Scale);
+        int parent = skeleton.Nodes[i].Parent;
+        var m = parent >= 0 && parent < skeleton.Count && parent != i
+            ? ResolveOs(parent, frame, skeleton, os) * local
+            : local;
+        os[i] = m;
+        return m;
+    }
+
+    private static void ApplyDeltaToFrame(List<NodeTransform> frame, Skeleton skeleton, List<int> nodeIndices, Matrix4 delta)
+    {
+        var os = FrameObjectSpaceMatrices(frame, skeleton);
+        foreach (int node in nodeIndices)
+            if (node < os.Length) os[node] = delta * os[node];
+        foreach (int node in nodeIndices)
+        {
+            if (node >= frame.Count) continue;
+            int parent = skeleton.Nodes[node].Parent;
+            var local = parent >= 0 && parent < os.Length
+                ? os[parent].Inverse() * os[node]
+                : os[node];
+            var (translation, rotation, scale) = local.Decompose();
+            frame[node] = new NodeTransform { Translation = translation, Rotation = rotation, Scale = scale };
+        }
+    }
 }
 
 /// <summary>Composes a decoded <see cref="AnimationClip"/> against a skeleton
@@ -85,6 +240,96 @@ internal static class PoseComposer
                 var rotation = PickRotation(clip, res, f) ?? def.Rotation;
                 var translation = PickTranslation(clip, res, f) ?? def.Translation;
                 var scale = PickScale(clip, res, f) ?? def.Scale;
+                row.Add(new NodeTransform { Rotation = rotation, Translation = translation, Scale = scale });
+            }
+            frames.Add(row);
+        }
+        return new Pose { Frames = frames };
+    }
+
+    /// <summary>Compose an <b>overlay</b> (delta) animation onto a base/
+    /// rest pose, matching Foundry's <c>compose_overlay_animation</c> and
+    /// the Rust <c>overlay_pose</c>. Returns the per-bone composition base
+    /// (<c>Reference</c> — static-track value where static-flagged, else
+    /// <paramref name="base"/>; this is also the leading frame the writer
+    /// prepends) and the <c>frame_count</c> composed body frames. Animated
+    /// components apply their per-frame delta on top of the reference
+    /// (translation additive, rotation <c>reference * delta</c>, scale
+    /// <b>multiplicative</b>); every other component holds the reference.</summary>
+    public static (List<NodeTransform> Reference, Pose Body) OverlayPose(
+        AnimationClip clip, Skeleton skeleton, IReadOnlyList<NodeTransform> @base)
+    {
+        int bones = skeleton.Count;
+        int framesN = System.Math.Max(1, (int)clip.FrameCount);
+
+        var resolutions = new BoneResolution[bones];
+        for (int b = 0; b < bones; b++) resolutions[b] = ResolveBone(b, clip.NodeFlags);
+
+        var reference = new List<NodeTransform>(bones);
+        for (int b = 0; b < bones; b++)
+        {
+            var res = resolutions[b];
+            var baseB = b < @base.Count ? @base[b] : NodeTransform.Identity;
+            reference.Add(new NodeTransform
+            {
+                Rotation = res.Rotation.Kind == SourceKind.Static ? PickRotation(clip, res, 0) ?? baseB.Rotation : baseB.Rotation,
+                Translation = res.Translation.Kind == SourceKind.Static ? PickTranslation(clip, res, 0) ?? baseB.Translation : baseB.Translation,
+                Scale = res.Scale.Kind == SourceKind.Static ? PickScale(clip, res, 0) ?? baseB.Scale : baseB.Scale,
+            });
+        }
+
+        var frames = new List<List<NodeTransform>>(framesN);
+        for (int f = 0; f < framesN; f++)
+        {
+            var row = new List<NodeTransform>(bones);
+            for (int b = 0; b < bones; b++)
+            {
+                var res = resolutions[b];
+                var r = reference[b];
+                var rotation = res.Rotation.Kind == SourceKind.Animated
+                    ? r.Rotation.Mul(PickRotation(clip, res, f) ?? new RealQuaternion(0, 0, 0, 1))
+                    : r.Rotation;
+                RealPoint3d translation;
+                if (res.Translation.Kind == SourceKind.Animated)
+                {
+                    var d = PickTranslation(clip, res, f) ?? default;
+                    translation = new RealPoint3d(r.Translation.X + d.X, r.Translation.Y + d.Y, r.Translation.Z + d.Z);
+                }
+                else translation = r.Translation;
+                var scale = res.Scale.Kind == SourceKind.Animated ? r.Scale * (PickScale(clip, res, f) ?? 1.0f) : r.Scale;
+                row.Add(new NodeTransform { Rotation = rotation, Translation = translation, Scale = scale });
+            }
+            frames.Add(row);
+        }
+
+        return (reference, new Pose { Frames = frames });
+    }
+
+    /// <summary>Compose a <b>replacement</b> animation against a base/rest
+    /// pose, matching Foundry's <c>compose_replacement_animation</c> and
+    /// the Rust <c>replacement_pose</c>. Only <b>animated</b>-flagged
+    /// components take the codec value (a full pose, not a delta); every
+    /// other component — including <i>static</i>-flagged ones — takes the
+    /// <paramref name="base"/> (rest) value.</summary>
+    public static Pose ReplacementPose(AnimationClip clip, Skeleton skeleton, IReadOnlyList<NodeTransform> @base)
+    {
+        int bones = skeleton.Count;
+        int framesN = System.Math.Max(1, (int)clip.FrameCount);
+
+        var resolutions = new BoneResolution[bones];
+        for (int b = 0; b < bones; b++) resolutions[b] = ResolveBone(b, clip.NodeFlags);
+
+        var frames = new List<List<NodeTransform>>(framesN);
+        for (int f = 0; f < framesN; f++)
+        {
+            var row = new List<NodeTransform>(bones);
+            for (int b = 0; b < bones; b++)
+            {
+                var res = resolutions[b];
+                var baseB = b < @base.Count ? @base[b] : NodeTransform.Identity;
+                var rotation = res.Rotation.Kind == SourceKind.Animated ? PickRotation(clip, res, f) ?? baseB.Rotation : baseB.Rotation;
+                var translation = res.Translation.Kind == SourceKind.Animated ? PickTranslation(clip, res, f) ?? baseB.Translation : baseB.Translation;
+                var scale = res.Scale.Kind == SourceKind.Animated ? PickScale(clip, res, f) ?? baseB.Scale : baseB.Scale;
                 row.Add(new NodeTransform { Rotation = rotation, Translation = translation, Scale = scale });
             }
             frames.Add(row);

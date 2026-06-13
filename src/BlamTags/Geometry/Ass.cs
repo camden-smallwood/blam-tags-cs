@@ -485,6 +485,281 @@ public sealed class AssFile
     }
 
     //================================================================
+    // Halo 2 scenario_structure_bsp → ASS v2
+    //================================================================
+
+    /// <summary>Reconstruct the ASS scene for a Halo 2 structure_bsp. H2 keeps
+    /// geometry inline (not in a raw-resource): cluster geom under
+    /// <c>cluster data[0]/section</c>, instanced geom under <c>render info/
+    /// render data[0]/section</c>, collision in the top-level <c>collision
+    /// bsp</c>. Emitted ASS targets version 2.</summary>
+    public static AssFile FromScenarioStructureBspH2(TagFile tag)
+    {
+        var root = tag.Root;
+        var materials = ReadMaterialsH2(root);
+        int materialsCount = materials.Count;
+        var objects = new List<AssObject>();
+        var instances = new List<AssInstance>();
+
+        // INSTANCE 0 = Scene Root.
+        instances.Add(new AssInstance { ObjectIndex = -1, Name = "Scene Root", UniqueId = 0, ParentId = -1 });
+
+        // Clusters → MESH OBJECTs at origin.
+        var clusters = root.FieldPath("clusters")?.AsBlock() ?? throw Missing("clusters");
+        for (int ci = 0; ci < clusters.Count; ci++)
+        {
+            var section = clusters.Element(ci)!.FieldPath("cluster data[0]/section")?.AsStruct();
+            if (section is null) continue;
+            var obj = BuildH2SectionObject(section, materialsCount);
+            if (obj.VerticesLen == 0) continue;
+            int oi = objects.Count; objects.Add(obj);
+            instances.Add(new AssInstance { ObjectIndex = oi, Name = $"cluster_{ci}", UniqueId = instances.Count, ParentId = 0 });
+        }
+
+        // Cluster portals → `+portal`-named MESHes.
+        int portalMat = EnsureSpecialMaterial(materials, "+portal");
+        var portals = root.FieldPath("cluster portals")?.AsBlock();
+        if (portals is not null)
+        {
+            for (int pi = 0; pi < portals.Count; pi++)
+            {
+                var vb = portals.Element(pi)!.Field("vertices")?.AsBlock();
+                if (vb is null || vb.Count < 3) continue;
+                var verts = new List<AssVertex>(vb.Count);
+                for (int vi = 0; vi < vb.Count; vi++)
+                {
+                    var p = vb.Element(vi)!.ReadPointOrVec("point");
+                    verts.Add(new AssVertex { Position = p.Mul(Geometry.Scale), Normal = new RealVector3d(0, 0, 1), Uvs = new() { default } });
+                }
+                var tris = new List<AssTriangle>();
+                for (int k = 1; k < verts.Count - 1; k++) tris.Add(new AssTriangle(portalMat, 0, (uint)k, (uint)k + 1));
+                int oi = objects.Count;
+                objects.Add(new AssObject { Payload = new AssObjectPayload.Mesh(verts, tris) });
+                instances.Add(new AssInstance { ObjectIndex = oi, Name = $"+portal_{pi}", UniqueId = instances.Count, ParentId = 0 });
+            }
+        }
+
+        // Instanced geometries → one MESH per definition (content-deduped).
+        var defs = root.FieldPath("instanced geometries definitions")?.AsBlock();
+        var instBlock = root.FieldPath("instanced geometry instances")?.AsBlock();
+        if (defs is not null && instBlock is not null)
+        {
+            var defObjectIndex = new int?[defs.Count];
+            var contentToIndex = new Dictionary<string, int>();
+            for (int di = 0; di < defs.Count; di++)
+            {
+                var section = defs.Element(di)!.FieldPath("render info/render data[0]/section")?.AsStruct();
+                if (section is null) continue;
+                var obj = BuildH2SectionObject(section, materialsCount);
+                if (obj.VerticesLen == 0) continue;
+                string key = ObjectContentKey(obj);
+                if (contentToIndex.TryGetValue(key, out int existing)) defObjectIndex[di] = existing;
+                else { int idx = objects.Count; contentToIndex[key] = idx; defObjectIndex[di] = idx; objects.Add(obj); }
+            }
+            for (int ii = 0; ii < instBlock.Count; ii++)
+            {
+                var inst = instBlock.Element(ii)!;
+                long defIdx = inst.ReadIntAny("instance definition") ?? -1;
+                if (defIdx < 0 || defIdx >= defObjectIndex.Length || defObjectIndex[defIdx] is not int oi) continue;
+                var rot = MathExtensions.FromBasisColumns(inst.ReadVec3("forward"), inst.ReadVec3("left"), inst.ReadVec3("up"));
+                instances.Add(new AssInstance
+                {
+                    ObjectIndex = oi,
+                    Name = inst.ReadStringId("name") ?? $"instance_{ii}",
+                    UniqueId = instances.Count, ParentId = 0,
+                    LocalRotation = rot,
+                    LocalTranslation = inst.ReadPointOrVec("position").Mul(Geometry.Scale),
+                    LocalScale = inst.ReadReal("scale") ?? 1.0f,
+                });
+            }
+        }
+
+        // Weather polyhedra → `+weather`-named hull MESHes.
+        int weatherMat = EnsureSpecialMaterial(materials, "+weather");
+        var wpBlock = root.FieldPath("weather polyhedra")?.AsBlock();
+        if (wpBlock is not null)
+        {
+            for (int wi = 0; wi < wpBlock.Count; wi++)
+            {
+                var planesBlock = wpBlock.Element(wi)!.Field("planes")?.AsBlock();
+                if (planesBlock is null) continue;
+                var planes = new List<RealPlane3d>(planesBlock.Count);
+                for (int pi = 0; pi < planesBlock.Count; pi++) planes.Add(planesBlock.Element(pi)!.ReadPlane3d("plane"));
+                if (planes.Count < 4) continue;
+                var (verts, tris) = PolyhedronFromPlanes(planes, weatherMat);
+                if (verts.Count == 0) continue;
+                int oi = objects.Count;
+                objects.Add(new AssObject { Payload = new AssObjectPayload.Mesh(verts, tris) });
+                instances.Add(new AssInstance { ObjectIndex = oi, Name = $"+weather_{wi}", UniqueId = instances.Count, ParentId = 0 });
+            }
+        }
+
+        // Markers → SPHERE primitives.
+        var markersBlock = root.FieldPath("markers")?.AsBlock();
+        if (markersBlock is not null)
+        {
+            for (int mi = 0; mi < markersBlock.Count; mi++)
+            {
+                var m = markersBlock.Element(mi)!;
+                int oi = objects.Count;
+                objects.Add(new AssObject { Payload = new AssObjectPayload.Sphere(-1, 10.0f) });
+                instances.Add(new AssInstance
+                {
+                    ObjectIndex = oi, Name = m.ReadString("name") ?? $"marker_{mi}",
+                    UniqueId = instances.Count, ParentId = 0,
+                    LocalRotation = m.ReadQuat("rotation"),
+                    LocalTranslation = m.ReadPointOrVec("position").Mul(Geometry.Scale),
+                });
+            }
+        }
+
+        // Environment objects → XREF OBJECTs.
+        var envObjects = root.FieldPath("environment objects")?.AsBlock();
+        var envPalette = root.FieldPath("environment object palette")?.AsBlock();
+        if (envObjects is not null && envPalette is not null)
+        {
+            var paletteObjectIndex = new int?[envPalette.Count];
+            for (int pi = 0; pi < envPalette.Count; pi++)
+            {
+                var pal = envPalette.Element(pi)!;
+                string xref = pal.ReadTagRefPath("definition") ?? pal.ReadTagRefPath("object") ?? "";
+                if (string.IsNullOrEmpty(xref)) continue;
+                paletteObjectIndex[pi] = objects.Count;
+                objects.Add(new AssObject { XrefFilepath = xref, XrefObjectname = FileStem(xref, "env_object"), Payload = new AssObjectPayload.Mesh(new(), new()) });
+            }
+            for (int ei = 0; ei < envObjects.Count; ei++)
+            {
+                var placement = envObjects.Element(ei)!;
+                long pi = placement.ReadIntAny("palette_index") ?? placement.ReadIntAny("palette index") ?? -1;
+                if (pi < 0 || pi >= paletteObjectIndex.Length || paletteObjectIndex[pi] is not int oi) continue;
+                instances.Add(new AssInstance
+                {
+                    ObjectIndex = oi, Name = placement.ReadString("name") ?? $"env_object_{ei}",
+                    UniqueId = instances.Count, ParentId = 0,
+                    LocalRotation = placement.ReadQuat("rotation"),
+                    LocalTranslation = placement.ReadPointOrVec("translation").Mul(Geometry.Scale),
+                });
+            }
+        }
+
+        // Structure collision BSP → single `@CollideOnly` MESH.
+        var collBlock = root.FieldPath("collision bsp")?.AsBlock();
+        if (collBlock is not null)
+        {
+            int collMat = EnsureSpecialMaterial(materials, "@collision_only");
+            var (verts, tris) = BuildH2CollisionMesh(collBlock, collMat);
+            if (verts.Count > 0)
+            {
+                int oi = objects.Count;
+                objects.Add(new AssObject { Payload = new AssObjectPayload.Mesh(verts, tris) });
+                instances.Add(new AssInstance { ObjectIndex = oi, Name = "@CollideOnly", UniqueId = instances.Count, ParentId = 0 });
+            }
+        }
+
+        return new AssFile
+        {
+            HeaderTool = "blam-tags", HeaderToolVersion = "0.1", HeaderUser = "blam-tag-shell", HeaderMachine = "",
+            Materials = materials, Objects = objects, Instances = instances,
+        };
+    }
+
+    private static List<AssMaterial> ReadMaterialsH2(TagStruct root)
+    {
+        var block = root.FieldPath("materials")?.AsBlock() ?? throw Missing("materials");
+        var outList = new List<AssMaterial>(block.Count);
+        for (int i = 0; i < block.Count; i++)
+        {
+            var m = block.Element(i)!;
+            string path = m.ReadTagRefPath("shader") ?? m.ReadTagRefPath("old shader") ?? "";
+            outList.Add(new AssMaterial { Name = FileStem(path, "default"), LightmapVariant = "", BmStrings = new() });
+        }
+        return outList;
+    }
+
+    /// <summary>Build a MESH from an H2 sbsp section. Unlike H2 render_model
+    /// (triangle strips with 0xFFFF restart), H2 sbsp cluster/IGD geometry is
+    /// triangle LISTS — each part's strip range is consecutive index triples.</summary>
+    private static AssObject BuildH2SectionObject(TagStruct section, int materialsCount)
+    {
+        var rawV = section.Field("raw vertices")?.AsBlock();
+        var strip = section.Field("strip indices")?.AsBlock();
+        var parts = section.Field("parts")?.AsBlock();
+        if (rawV is null || strip is null || parts is null) return AssObject.EmptyMesh();
+
+        var stripIdx = new uint[strip.Count];
+        for (int k = 0; k < strip.Count; k++) stripIdx[k] = (uint)(strip.Element(k)!.ReadIntAny("index") ?? 0);
+
+        var verts = new List<AssVertex>();
+        var tris = new List<AssTriangle>();
+        foreach (var part in parts.Elements())
+        {
+            int mat = (int)(part.ReadIntAny("material") ?? 0);
+            if (mat < 0 || mat >= materialsCount) mat = 0;
+            int start = (int)System.Math.Max(part.ReadIntAny("strip start index") ?? 0, 0);
+            int len = (int)System.Math.Max(part.ReadIntAny("strip length") ?? 0, 0);
+            if (start >= stripIdx.Length) continue;
+            int end = System.Math.Min(start + len, stripIdx.Length);
+            for (int t = start; t + 3 <= end; t += 3)
+            {
+                uint baseIdx = (uint)verts.Count;
+                bool ok = true;
+                for (int j = 0; j < 3; j++)
+                {
+                    var v = rawV.Element((int)stripIdx[t + j]);
+                    if (v is null) { ok = false; break; }
+                    var jv = JmsFile.ReadH2Vertex(v);
+                    var uv = jv.Uvs.Count > 0 ? jv.Uvs[0] : default;
+                    verts.Add(new AssVertex { Position = jv.Position, Normal = jv.Normal, Uvs = new() { new RealPoint3d(uv.X, uv.Y, 0f) } });
+                }
+                if (ok) tris.Add(new AssTriangle(mat, baseIdx, baseIdx + 1, baseIdx + 2));
+                else verts.RemoveRange((int)baseIdx, verts.Count - (int)baseIdx);
+            }
+        }
+        return new AssObject { Payload = new AssObjectPayload.Mesh(verts, tris) };
+    }
+
+    /// <summary>Build a single fanned `@CollideOnly` mesh from a collision-bsp
+    /// block (edge-ring walk per surface). Vertices are world-space.</summary>
+    private static (List<AssVertex>, List<AssTriangle>) BuildH2CollisionMesh(TagBlock collBlock, int materialIndex)
+    {
+        var verts = new List<AssVertex>();
+        var tris = new List<AssTriangle>();
+        foreach (var bsp in collBlock.Elements())
+        {
+            var surfaces = bsp.Field("surfaces")?.AsBlock();
+            var edges = bsp.Field("edges")?.AsBlock();
+            var bspVerts = bsp.Field("vertices")?.AsBlock();
+            if (surfaces is null || edges is null || bspVerts is null) continue;
+            var edgeCache = new List<Geometry.EdgeRow>(edges.Count);
+            for (int k = 0; k < edges.Count; k++)
+            {
+                var e = edges.Element(k)!;
+                edgeCache.Add(new Geometry.EdgeRow(
+                    (int)(e.ReadIntAny("start vertex") ?? -1), (int)(e.ReadIntAny("end vertex") ?? -1),
+                    (int)(e.ReadIntAny("forward edge") ?? -1), (int)(e.ReadIntAny("reverse edge") ?? -1),
+                    (int)(e.ReadIntAny("left surface") ?? -1), (int)(e.ReadIntAny("right surface") ?? -1)));
+            }
+            var points = new RealPoint3d[bspVerts.Count];
+            for (int k = 0; k < bspVerts.Count; k++) points[k] = bspVerts.Element(k)!.ReadPointOrVec("point").Mul(Geometry.Scale);
+            for (int si = 0; si < surfaces.Count; si++)
+            {
+                int firstEdge = (int)(surfaces.Element(si)!.ReadIntAny("first edge") ?? -1);
+                if (firstEdge < 0) continue;
+                var polygon = Geometry.WalkSurfaceRing(si, firstEdge, edgeCache);
+                if (polygon.Count < 3) continue;
+                uint baseFan = (uint)verts.Count;
+                foreach (int vi in polygon)
+                {
+                    var pos = vi >= 0 && vi < points.Length ? points[vi] : default;
+                    verts.Add(new AssVertex { Position = pos, Normal = new RealVector3d(0, 0, 1), Uvs = new() { default } });
+                }
+                for (uint k = 1; k < polygon.Count - 1; k++) tris.Add(new AssTriangle(materialIndex, baseFan, baseFan + k, baseFan + k + 1));
+            }
+        }
+        return (verts, tris);
+    }
+
+    //================================================================
     // stli lighting
     //================================================================
 
@@ -1005,29 +1280,34 @@ public sealed class AssFile
     // version-7 text writer
     //================================================================
 
-    public void Write(Stream stream)
+    public void Write(Stream stream, int version = 7)
     {
         using var w = new StreamWriter(stream, new UTF8Encoding(false), 1 << 16, leaveOpen: true) { AutoFlush = false };
-        Write(w);
+        Write(w, version);
         w.Flush();
     }
 
-    public string ToText()
+    public string ToText(int version = 7)
     {
         var sb = new StringBuilder();
         using var w = new StringWriter(sb);
-        Write(w);
+        Write(w, version);
         return sb.ToString();
     }
 
-    private void Write(TextWriter w)
+    /// <summary>Write the ASS at the given format version (Halo 2 → 2,
+    /// Halo 3 → 7). Version deltas (from the H3 Blender exporter): material
+    /// BM_ lighting strings v4+, vertex color v6+, 3-component UVs v5+, and
+    /// the node-set / triangle layout switches to tab-separated single lines
+    /// at v3+ (older writes them on separate lines).</summary>
+    private void Write(TextWriter w, int version)
     {
         void NL() => w.Write('\n');
         void L(string s) { w.Write(s); w.Write('\n'); }
 
         // HEADER
         L(";### HEADER ###");
-        L("7");
+        L(N(version));
         L($"\"{HeaderTool}\"");
         L($"\"{HeaderToolVersion}\"");
         L($"\"{HeaderUser}\"");
@@ -1044,8 +1324,11 @@ public sealed class AssFile
             L($";MATERIAL {i}");
             L($"\"{m.Name}\"");
             L($"\"{m.LightmapVariant}\"");
-            L(N(m.BmStrings.Count));
-            foreach (var s in m.BmStrings) L($"\"{s}\"");
+            if (version >= 4)
+            {
+                L(N(m.BmStrings.Count));
+                foreach (var s in m.BmStrings) L($"\"{s}\"");
+            }
         }
         NL();
 
@@ -1069,17 +1352,18 @@ public sealed class AssFile
                         NL();
                         WriteFloats(w, v.Position.ToArray());
                         WriteFloats(w, v.Normal.ToArray());
-                        WriteFloats(w, [v.Color.Red, v.Color.Green, v.Color.Blue]);
+                        if (version >= 6)
+                            WriteFloats(w, [v.Color.Red, v.Color.Green, v.Color.Blue]);
                         w.Write(N(v.NodeSet.Count));
                         foreach (var (idx, weight) in v.NodeSet)
-                            w.Write($"\n{N(idx)}\t{Fr(weight)}");
+                            w.Write(version >= 3 ? $"\n{N(idx)}\t{Fr(weight)}" : $"\n{N(idx)}\n{Fr(weight)}");
                         w.Write($"\n{N(v.Uvs.Count)}");
                         foreach (var uv in v.Uvs)
-                            w.Write($"\n{Fr(uv.X)}\t{Fr(uv.Y)}\t{Fr(uv.Z)}\n");
+                            w.Write(version >= 5 ? $"\n{Fr(uv.X)}\t{Fr(uv.Y)}\t{Fr(uv.Z)}\n" : $"\n{Fr(uv.X)}\t{Fr(uv.Y)}");
                     }
                     w.Write($"\n{N(mesh.Triangles.Count)}");
                     foreach (var t in mesh.Triangles)
-                        w.Write($"\n{N(t.Material)}\t\t{t.V0}\t{t.V1}\t{t.V2}");
+                        w.Write(version >= 3 ? $"\n{N(t.Material)}\t\t{t.V0}\t{t.V1}\t{t.V2}" : $"\n{N(t.Material)}\n{t.V0}\n{t.V1}\n{t.V2}");
                     NL();
                     break;
                 case AssObjectPayload.GenericLight gl:

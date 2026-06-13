@@ -180,7 +180,7 @@ internal static class TagFieldCodec
     /// variants write into <paramref name="raw"/> at the field offset (LE) and
     /// return null; sub-chunk-leaf variants return new content for the caller
     /// to swap in.</summary>
-    public static TagSubChunkContent? Serialize(TagFieldLayout field, TagFieldData value, Span<byte> raw)
+    public static TagSubChunkContent? Serialize(TagFieldLayout field, TagFieldData value, Span<byte> raw, Endian e)
     {
         int o = (int)field.Offset;
         switch (value)
@@ -189,82 +189,82 @@ internal static class TagFieldCodec
             case TagFieldData.LongString s: EncodeNullPadded(s.Value, raw.Slice(o, 256)); return null;
 
             case TagFieldData.CharInteger v: raw[o] = (byte)v.Value; return null;
-            case TagFieldData.ShortInteger v: WI16(raw, o, v.Value); return null;
-            case TagFieldData.LongInteger v: WI32(raw, o, v.Value); return null;
-            case TagFieldData.Int64Integer v: WI64(raw, o, v.Value); return null;
+            case TagFieldData.ShortInteger v: WI16(raw, o, v.Value, e); return null;
+            case TagFieldData.LongInteger v: WI32(raw, o, v.Value, e); return null;
+            case TagFieldData.Int64Integer v: WI64(raw, o, v.Value, e); return null;
             case TagFieldData.ByteInteger v: raw[o] = v.Value; return null;
-            case TagFieldData.WordInteger v: WU16(raw, o, v.Value); return null;
-            case TagFieldData.DwordInteger v: WU32(raw, o, v.Value); return null;
-            case TagFieldData.QwordInteger v: WU64(raw, o, v.Value); return null;
-            case TagFieldData.Tag v: WU32(raw, o, v.Value); return null;
+            case TagFieldData.WordInteger v: WU16(raw, o, v.Value, e); return null;
+            case TagFieldData.DwordInteger v: WU32(raw, o, v.Value, e); return null;
+            case TagFieldData.QwordInteger v: WU64(raw, o, v.Value, e); return null;
+            case TagFieldData.Tag v: WU32(raw, o, v.Value, e); return null;
 
             case TagFieldData.CharEnum v: raw[o] = (byte)v.Value; return null;
-            case TagFieldData.ShortEnum v: WI16(raw, o, v.Value); return null;
-            case TagFieldData.LongEnum v: WI32(raw, o, v.Value); return null;
+            case TagFieldData.ShortEnum v: WI16(raw, o, v.Value, e); return null;
+            case TagFieldData.LongEnum v: WI32(raw, o, v.Value, e); return null;
 
             case TagFieldData.ByteFlags v: raw[o] = v.Value; return null;
-            case TagFieldData.WordFlags v: WU16(raw, o, v.Value); return null;
-            case TagFieldData.LongFlags v: WI32(raw, o, v.Value); return null;
+            case TagFieldData.WordFlags v: WU16(raw, o, v.Value, e); return null;
+            case TagFieldData.LongFlags v: WI32(raw, o, v.Value, e); return null;
 
             case TagFieldData.ByteBlockFlags v: raw[o] = v.Value; return null;
-            case TagFieldData.WordBlockFlags v: WU16(raw, o, v.Value); return null;
-            case TagFieldData.LongBlockFlags v: WI32(raw, o, v.Value); return null;
+            case TagFieldData.WordBlockFlags v: WU16(raw, o, v.Value, e); return null;
+            case TagFieldData.LongBlockFlags v: WI32(raw, o, v.Value, e); return null;
 
             case TagFieldData.CharBlockIndex v: raw[o] = (byte)v.Value; return null;
             case TagFieldData.CustomCharBlockIndex v: raw[o] = (byte)v.Value; return null;
-            case TagFieldData.ShortBlockIndex v: WI16(raw, o, v.Value); return null;
-            case TagFieldData.CustomShortBlockIndex v: WI16(raw, o, v.Value); return null;
-            case TagFieldData.LongBlockIndex v: WI32(raw, o, v.Value); return null;
-            case TagFieldData.CustomLongBlockIndex v: WI32(raw, o, v.Value); return null;
+            case TagFieldData.ShortBlockIndex v: WI16(raw, o, v.Value, e); return null;
+            case TagFieldData.CustomShortBlockIndex v: WI16(raw, o, v.Value, e); return null;
+            case TagFieldData.LongBlockIndex v: WI32(raw, o, v.Value, e); return null;
+            case TagFieldData.CustomLongBlockIndex v: WI32(raw, o, v.Value, e); return null;
 
-            case TagFieldData.Angle v: WF32(raw, o, v.Value); return null;
-            case TagFieldData.Real v: WF32(raw, o, v.Value); return null;
-            case TagFieldData.RealSlider v: WF32(raw, o, v.Value); return null;
-            case TagFieldData.RealFraction v: WF32(raw, o, v.Value); return null;
+            case TagFieldData.Angle v: WF32(raw, o, v.Value, e); return null;
+            case TagFieldData.Real v: WF32(raw, o, v.Value, e); return null;
+            case TagFieldData.RealSlider v: WF32(raw, o, v.Value, e); return null;
+            case TagFieldData.RealFraction v: WF32(raw, o, v.Value, e); return null;
 
             case TagFieldData.Point2dValue v:
-                WI16(raw, o, v.Value.X); WI16(raw, o + 2, v.Value.Y); return null;
+                WI16(raw, o, v.Value.X, e); WI16(raw, o + 2, v.Value.Y, e); return null;
             case TagFieldData.Rectangle2dValue v:
-                WI16(raw, o, v.Value.Top); WI16(raw, o + 2, v.Value.Left);
-                WI16(raw, o + 4, v.Value.Bottom); WI16(raw, o + 6, v.Value.Right); return null;
+                WI16(raw, o, v.Value.Top, e); WI16(raw, o + 2, v.Value.Left, e);
+                WI16(raw, o + 4, v.Value.Bottom, e); WI16(raw, o + 6, v.Value.Right, e); return null;
             case TagFieldData.RealPoint2dValue v:
-                WF32(raw, o, v.Value.X); WF32(raw, o + 4, v.Value.Y); return null;
+                WF32(raw, o, v.Value.X, e); WF32(raw, o + 4, v.Value.Y, e); return null;
             case TagFieldData.RealPoint3dValue v:
-                WF32(raw, o, v.Value.X); WF32(raw, o + 4, v.Value.Y); WF32(raw, o + 8, v.Value.Z); return null;
+                WF32(raw, o, v.Value.X, e); WF32(raw, o + 4, v.Value.Y, e); WF32(raw, o + 8, v.Value.Z, e); return null;
             case TagFieldData.RealVector2dValue v:
-                WF32(raw, o, v.Value.I); WF32(raw, o + 4, v.Value.J); return null;
+                WF32(raw, o, v.Value.I, e); WF32(raw, o + 4, v.Value.J, e); return null;
             case TagFieldData.RealVector3dValue v:
-                WF32(raw, o, v.Value.I); WF32(raw, o + 4, v.Value.J); WF32(raw, o + 8, v.Value.K); return null;
+                WF32(raw, o, v.Value.I, e); WF32(raw, o + 4, v.Value.J, e); WF32(raw, o + 8, v.Value.K, e); return null;
             case TagFieldData.RealQuaternionValue v:
-                WF32(raw, o, v.Value.I); WF32(raw, o + 4, v.Value.J); WF32(raw, o + 8, v.Value.K); WF32(raw, o + 12, v.Value.W); return null;
+                WF32(raw, o, v.Value.I, e); WF32(raw, o + 4, v.Value.J, e); WF32(raw, o + 8, v.Value.K, e); WF32(raw, o + 12, v.Value.W, e); return null;
             case TagFieldData.RealEulerAngles2dValue v:
-                WF32(raw, o, v.Value.Yaw); WF32(raw, o + 4, v.Value.Pitch); return null;
+                WF32(raw, o, v.Value.Yaw, e); WF32(raw, o + 4, v.Value.Pitch, e); return null;
             case TagFieldData.RealEulerAngles3dValue v:
-                WF32(raw, o, v.Value.Yaw); WF32(raw, o + 4, v.Value.Pitch); WF32(raw, o + 8, v.Value.Roll); return null;
+                WF32(raw, o, v.Value.Yaw, e); WF32(raw, o + 4, v.Value.Pitch, e); WF32(raw, o + 8, v.Value.Roll, e); return null;
             case TagFieldData.RealPlane2dValue v:
-                WF32(raw, o, v.Value.I); WF32(raw, o + 4, v.Value.J); WF32(raw, o + 8, v.Value.D); return null;
+                WF32(raw, o, v.Value.I, e); WF32(raw, o + 4, v.Value.J, e); WF32(raw, o + 8, v.Value.D, e); return null;
             case TagFieldData.RealPlane3dValue v:
-                WF32(raw, o, v.Value.I); WF32(raw, o + 4, v.Value.J); WF32(raw, o + 8, v.Value.K); WF32(raw, o + 12, v.Value.D); return null;
+                WF32(raw, o, v.Value.I, e); WF32(raw, o + 4, v.Value.J, e); WF32(raw, o + 8, v.Value.K, e); WF32(raw, o + 12, v.Value.D, e); return null;
 
-            case TagFieldData.RgbColorValue v: WU32(raw, o, v.Value.Packed); return null;
-            case TagFieldData.ArgbColorValue v: WU32(raw, o, v.Value.Packed); return null;
+            case TagFieldData.RgbColorValue v: WU32(raw, o, v.Value.Packed, e); return null;
+            case TagFieldData.ArgbColorValue v: WU32(raw, o, v.Value.Packed, e); return null;
             case TagFieldData.RealRgbColorValue v:
-                WF32(raw, o, v.Value.Red); WF32(raw, o + 4, v.Value.Green); WF32(raw, o + 8, v.Value.Blue); return null;
+                WF32(raw, o, v.Value.Red, e); WF32(raw, o + 4, v.Value.Green, e); WF32(raw, o + 8, v.Value.Blue, e); return null;
             case TagFieldData.RealArgbColorValue v:
-                WF32(raw, o, v.Value.Alpha); WF32(raw, o + 4, v.Value.Red); WF32(raw, o + 8, v.Value.Green); WF32(raw, o + 12, v.Value.Blue); return null;
+                WF32(raw, o, v.Value.Alpha, e); WF32(raw, o + 4, v.Value.Red, e); WF32(raw, o + 8, v.Value.Green, e); WF32(raw, o + 12, v.Value.Blue, e); return null;
             case TagFieldData.RealHsvColorValue v:
-                WF32(raw, o, v.Value.Hue); WF32(raw, o + 4, v.Value.Saturation); WF32(raw, o + 8, v.Value.Value); return null;
+                WF32(raw, o, v.Value.Hue, e); WF32(raw, o + 4, v.Value.Saturation, e); WF32(raw, o + 8, v.Value.Value, e); return null;
             case TagFieldData.RealAhsvColorValue v:
-                WF32(raw, o, v.Value.Alpha); WF32(raw, o + 4, v.Value.Hue); WF32(raw, o + 8, v.Value.Saturation); WF32(raw, o + 12, v.Value.Value); return null;
+                WF32(raw, o, v.Value.Alpha, e); WF32(raw, o + 4, v.Value.Hue, e); WF32(raw, o + 8, v.Value.Saturation, e); WF32(raw, o + 12, v.Value.Value, e); return null;
 
             case TagFieldData.ShortIntegerBounds v:
-                WI16(raw, o, v.Value.Lower); WI16(raw, o + 2, v.Value.Upper); return null;
+                WI16(raw, o, v.Value.Lower, e); WI16(raw, o + 2, v.Value.Upper, e); return null;
             case TagFieldData.AngleBounds v:
-                WF32(raw, o, v.Value.Lower); WF32(raw, o + 4, v.Value.Upper); return null;
+                WF32(raw, o, v.Value.Lower, e); WF32(raw, o + 4, v.Value.Upper, e); return null;
             case TagFieldData.RealBounds v:
-                WF32(raw, o, v.Value.Lower); WF32(raw, o + 4, v.Value.Upper); return null;
+                WF32(raw, o, v.Value.Lower, e); WF32(raw, o + 4, v.Value.Upper, e); return null;
             case TagFieldData.FractionBounds v:
-                WF32(raw, o, v.Value.Lower); WF32(raw, o + 4, v.Value.Upper); return null;
+                WF32(raw, o, v.Value.Lower, e); WF32(raw, o + 4, v.Value.Upper, e); return null;
 
             case TagFieldData.Custom v:
                 v.Value.CopyTo(raw.Slice(o, v.Value.Length)); return null;
@@ -376,13 +376,13 @@ internal static class TagFieldCodec
     private static float F32(ReadOnlySpan<byte> r, int o, Endian e) =>
         e == Endian.Le ? BinaryPrimitives.ReadSingleLittleEndian(r.Slice(o, 4)) : BinaryPrimitives.ReadSingleBigEndian(r.Slice(o, 4));
 
-    private static void WI16(Span<byte> r, int o, short v) => BinaryPrimitives.WriteInt16LittleEndian(r.Slice(o, 2), v);
-    private static void WU16(Span<byte> r, int o, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(r.Slice(o, 2), v);
-    private static void WI32(Span<byte> r, int o, int v) => BinaryPrimitives.WriteInt32LittleEndian(r.Slice(o, 4), v);
-    private static void WU32(Span<byte> r, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(r.Slice(o, 4), v);
-    private static void WI64(Span<byte> r, int o, long v) => BinaryPrimitives.WriteInt64LittleEndian(r.Slice(o, 8), v);
-    private static void WU64(Span<byte> r, int o, ulong v) => BinaryPrimitives.WriteUInt64LittleEndian(r.Slice(o, 8), v);
-    private static void WF32(Span<byte> r, int o, float v) => BinaryPrimitives.WriteSingleLittleEndian(r.Slice(o, 4), v);
+    private static void WI16(Span<byte> r, int o, short v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteInt16LittleEndian(r.Slice(o, 2), v); else BinaryPrimitives.WriteInt16BigEndian(r.Slice(o, 2), v); }
+    private static void WU16(Span<byte> r, int o, ushort v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteUInt16LittleEndian(r.Slice(o, 2), v); else BinaryPrimitives.WriteUInt16BigEndian(r.Slice(o, 2), v); }
+    private static void WI32(Span<byte> r, int o, int v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteInt32LittleEndian(r.Slice(o, 4), v); else BinaryPrimitives.WriteInt32BigEndian(r.Slice(o, 4), v); }
+    private static void WU32(Span<byte> r, int o, uint v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteUInt32LittleEndian(r.Slice(o, 4), v); else BinaryPrimitives.WriteUInt32BigEndian(r.Slice(o, 4), v); }
+    private static void WI64(Span<byte> r, int o, long v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteInt64LittleEndian(r.Slice(o, 8), v); else BinaryPrimitives.WriteInt64BigEndian(r.Slice(o, 8), v); }
+    private static void WU64(Span<byte> r, int o, ulong v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteUInt64LittleEndian(r.Slice(o, 8), v); else BinaryPrimitives.WriteUInt64BigEndian(r.Slice(o, 8), v); }
+    private static void WF32(Span<byte> r, int o, float v, Endian e) { if (e == Endian.Le) BinaryPrimitives.WriteSingleLittleEndian(r.Slice(o, 4), v); else BinaryPrimitives.WriteSingleBigEndian(r.Slice(o, 4), v); }
 
     private static string DecodeNullPadded(ReadOnlySpan<byte> bytes)
     {
