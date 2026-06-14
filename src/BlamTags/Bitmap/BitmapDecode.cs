@@ -33,6 +33,10 @@ internal static class BitmapDecode
             case BitmapFormat.R8: DecodeR8(src, outBuf); break;
             case BitmapFormat.Ay8: DecodeAy8(src, outBuf); break;
 
+            // Classic palettized 8-bit (fixed 256-entry palette).
+            case BitmapFormat.P8:
+            case BitmapFormat.P8Bump: P8Palette.DecodeP8(src, outBuf); break;
+
             case BitmapFormat.A8y8: DecodeA8y8(src, outBuf); break;
             case BitmapFormat.R5g6b5: DecodeR5g6b5(src, outBuf); break;
             case BitmapFormat.A1r5g5b5: DecodeA1r5g5b5(src, outBuf); break;

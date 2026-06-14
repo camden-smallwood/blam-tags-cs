@@ -27,6 +27,11 @@ public enum BitmapFormat
     DxnMonoAlpha,
     Dxt5Red, Dxt5Green, Dxt5Blue,
     Depth24,
+    // Classic Halo CE / Halo 2 palettized 8-bit (1 byte/pixel = index
+    // into the fixed 256-entry normal palette; see P8Palette). P8Bump is
+    // the same storage + palette, kept distinct so the schema name
+    // round-trips. No native DDS pixelformat — decodes to A8R8G8B8.
+    P8, P8Bump,
 }
 
 /// <summary>Per-image gamma curve (<c>e_bitmap_curve</c>); read by index.</summary>
@@ -94,6 +99,8 @@ public static class BitmapFormatExtensions
         "dxt5_green" => BitmapFormat.Dxt5Green,
         "dxt5_blue" => BitmapFormat.Dxt5Blue,
         "depth 24" or "depth24" => BitmapFormat.Depth24,
+        "p8" => BitmapFormat.P8,
+        "p8-bump" or "p8_bump" => BitmapFormat.P8Bump,
         _ => null,
     };
 
@@ -148,7 +155,8 @@ public static class BitmapFormatExtensions
 
     public static uint BytesPerPixel(this BitmapFormat f) => f switch
     {
-        BitmapFormat.A8 or BitmapFormat.Y8 or BitmapFormat.Ay8 or BitmapFormat.R8 => 1,
+        BitmapFormat.A8 or BitmapFormat.Y8 or BitmapFormat.Ay8 or BitmapFormat.R8
+            or BitmapFormat.P8 or BitmapFormat.P8Bump => 1,
         BitmapFormat.A8y8 or BitmapFormat.R5g6b5 or BitmapFormat.A1r5g5b5 or BitmapFormat.A4r4g4b4
             or BitmapFormat.A4r4g4b4Font or BitmapFormat.V8u8 or BitmapFormat.G8b8
             or BitmapFormat.F16Mono or BitmapFormat.F16Red or BitmapFormat.L16 => 2,

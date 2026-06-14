@@ -55,10 +55,13 @@ public static class ExtractGeometryCommand
             "sbsp" => RunSbsp(ctx, RejectHlmtOnly(kinds, force, "scenario_structure_bsp", output)),
             // Halo CE references a gbxmodel (mod2) directly — no .model wrapper.
             "mod2" => RunGbxmodel(ctx, RejectHlmtOnly(kinds, force, "gbxmodel", output), flat),
+            // Direct render input: H2/H3 render_model (mode) → plain render JMS
+            // (the instance→ASS decision stays hlmt-only).
+            "mode" => RunRenderModel(ctx, RejectHlmtOnly(kinds, force, "render_model", output), flat),
             // Direct collision input: CE model_collision_geometry or H2/H3 collision_model.
             "coll" => RunCollision(ctx, RejectHlmtOnly(kinds, force, "collision_model", output), flat),
             _ => throw new CliError(
-                $"extract-geometry expects `.model` (hlmt), `.gbxmodel` (mod2, Halo CE), `.collision_model`/`.model_collision_geometry` (coll), `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) — got group `{group}`."),
+                $"extract-geometry expects `.model` (hlmt), `.render_model` (mode), `.gbxmodel` (mod2, Halo CE), `.collision_model`/`.model_collision_geometry` (coll), `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) — got group `{group}`."),
         };
     }
 
@@ -196,6 +199,21 @@ public static class ExtractGeometryCommand
         string outRoot = output ?? ".";
         string path = OutputPathFor(outRoot, stem, Kind.Render, flat, "jms");
         WriteJms(path, jms, version);
+        Console.WriteLine($"{path}: [render: JMS] {JmsSummary(jms)}");
+        return 0;
+    }
+
+    // mode → direct H2/H3 render_model → render JMS (engine-dispatched reader).
+    // No skeleton composition beyond the model's own nodes; instance-placement
+    // ASS output stays hlmt-only.
+    private static int RunRenderModel(CliContext ctx, string? output, bool flat)
+    {
+        var loaded = ctx.LoadedOrThrow("extract-geometry");
+        var game = loaded.Tag.GameOf();
+        var jms = ReadRenderJms(loaded.Tag, game);
+        string stem = Path.GetFileNameWithoutExtension(loaded.Path);
+        string path = OutputPathFor(output ?? ".", stem, Kind.Render, flat, "jms");
+        WriteJms(path, jms, game.JmsVersion());
         Console.WriteLine($"{path}: [render: JMS] {JmsSummary(jms)}");
         return 0;
     }

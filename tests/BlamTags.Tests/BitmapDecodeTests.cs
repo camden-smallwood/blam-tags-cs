@@ -57,4 +57,12 @@ public sealed class BitmapDecodeTests
         // u16 LE 0xF800 = R=0x1F G=0 B=0 → R=255
         AssertRgba(Decode(BitmapFormat.R5g6b5, 1, 1, [0x00, 0xF8]), 255, 0, 0, 255);
     }
+
+    [Fact] public void P8Bump_PaletteLookup()
+    {
+        // Index 0xFF is the flat normal (R=G=128, B=255) with zero alpha;
+        // plain p8 shares the same palette.
+        AssertRgba(Decode(BitmapFormat.P8Bump, 2, 1, [0xFF, 0x00]), 0x80, 0x80, 0xFF, 0x00);
+        AssertRgba(Decode(BitmapFormat.P8, 1, 1, [0xFF]), 0x80, 0x80, 0xFF, 0x00);
+    }
 }
