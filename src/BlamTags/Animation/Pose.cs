@@ -56,6 +56,28 @@ public sealed class Skeleton
 
     public int Count => Nodes.Count;
     public bool IsEmpty => Nodes.Count == 0;
+
+    /// <summary>Convert per-node OBJECT/model-space transforms into parent-LOCAL
+    /// transforms (<c>local = parent_object⁻¹ · node_object</c>). Reach and
+    /// Halo 4 store the rest pose (<c>additional node data</c>) in object space;
+    /// the JMA family wants parent-local, so the caller converts before using
+    /// them as defaults (Foundry's <c>world_to_local</c>). <paramref name="obj"/>
+    /// must align with <see cref="Nodes"/>; nodes assume parent-before-child.</summary>
+    public List<NodeTransform> ObjectToLocal(IReadOnlyList<NodeTransform> obj)
+    {
+        var world = new Matrix4[obj.Count];
+        for (int i = 0; i < obj.Count; i++)
+            world[i] = Matrix4.FromLocRotScale(obj[i].Translation, obj[i].Rotation, obj[i].Scale);
+        var result = new List<NodeTransform>(Nodes.Count);
+        for (int i = 0; i < Nodes.Count; i++)
+        {
+            int p = Nodes[i].Parent;
+            var local = p >= 0 && p < world.Length ? world[p].Inverse() * world[i] : world[i];
+            var (t, r, s) = local.Decompose();
+            result.Add(new NodeTransform { Translation = t, Rotation = r, Scale = s });
+        }
+        return result;
+    }
 }
 
 /// <summary>One bone's transform at one frame.</summary>

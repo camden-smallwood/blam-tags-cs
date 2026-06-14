@@ -86,7 +86,9 @@ public static class AnimationCodec
         bool hasStatic = codec == Codec.UncompressedStatic && staticFirstSize > 0;
         AnimationTracks staticTracks = hasStatic
             ? DecodeUncompressedStatic(blob)
-            : new AnimationTracks { Codec = Codec.UncompressedStatic, FrameCount = 1 };
+            // Halo 4: the static rest pose is a SharedStatic (codec 11) stream
+            // of int16 indices into the graph-level shared pool.
+            : DecodeSharedStatic(group) ?? new AnimationTracks { Codec = Codec.UncompressedStatic, FrameCount = 1 };
 
         ushort frameCount = (ushort)System.Math.Max(1, (int)(group.CodecFrameCount ?? group.FrameCount));
         SizeLayout layout = group.DataSizes?.Layout() ?? SizeLayout.H3;
@@ -326,6 +328,46 @@ public static class AnimationCodec
 
     private static int Max6(int a, int b, int c, int d, int e, int f) =>
         System.Math.Max(a, System.Math.Max(b, System.Math.Max(c, System.Math.Max(d, System.Math.Max(e, f)))));
+
+    /// <summary>Halo 4 SharedStatic (codec 11) static rest pose. The
+    /// <c>compressed_static_pose</c> blob section (the LAST section) holds only
+    /// int16 indices into the graph-level <see cref="SharedStaticPool"/>; values
+    /// come from that pool. One static frame per component, in codec-node order.
+    /// <c>null</c> when there's no pool / no section / not a SharedStatic header.
+    /// RE'd from the H4 Xbox debug build (rotation index table @byte 32,
+    /// translation @u32@12, scale @u32@16).</summary>
+    private static AnimationTracks? DecodeSharedStatic(AnimationGroup group)
+    {
+        if (group.SharedStatic is not { } pool) return null;
+        long cps = group.DataSizes?.Get("compressed_static_pose") ?? 0;
+        if (cps <= 0 || cps > group.Blob.Length) return null;
+        byte[] blob = group.Blob;
+        int b = blob.Length - (int)cps; // section start (compressed_static_pose is the last section)
+        if (cps < 32 || blob[b] != (byte)Codec.SharedStatic) return null;
+        int nRot = blob[b + 1], nTrn = blob[b + 2], nScl = blob[b + 3];
+        int trnOff = (int)BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(b + 12, 4));
+        int sclOff = (int)BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(b + 16, 4));
+        short Index(int o) => o >= 0 && b + o + 2 <= blob.Length
+            ? BinaryPrimitives.ReadInt16LittleEndian(blob.AsSpan(b + o, 2)) : (short)-1;
+
+        var tracks = new AnimationTracks { Codec = Codec.SharedStatic, FrameCount = 1 };
+        for (int k = 0; k < nRot; k++)
+        {
+            short idx = Index(32 + 2 * k);
+            tracks.Rotations.Add([idx >= 0 && idx < pool.Rotations.Count ? pool.Rotations[idx] : new RealQuaternion(0, 0, 0, 1)]);
+        }
+        for (int k = 0; k < nTrn; k++)
+        {
+            short idx = Index(trnOff + 2 * k);
+            tracks.Translations.Add([idx >= 0 && idx < pool.Translations.Count ? pool.Translations[idx] : default]);
+        }
+        for (int k = 0; k < nScl; k++)
+        {
+            short idx = Index(sclOff + 2 * k);
+            tracks.Scales.Add([idx >= 0 && idx < pool.Scales.Count ? pool.Scales[idx] : 1.0f]);
+        }
+        return tracks;
+    }
 
     //==== fullframe (slots 1/2/3/8) ====
 

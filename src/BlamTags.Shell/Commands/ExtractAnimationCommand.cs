@@ -43,7 +43,8 @@ public static class ExtractAnimationCommand
         var skeleton = Skeleton.FromTag(jmadTag);
         if (skeleton.IsEmpty) throw new CliError("jmad has no skeleton nodes — JMA export needs a skeleton");
 
-        var defaults = BuildDefaults(skeleton, jmadTag, renderModel);
+        bool objectSpace = AdditionalNodeDataIsObjectSpace(animation);
+        var defaults = BuildDefaults(skeleton, jmadTag, renderModel, objectSpace);
         // Overlay/replacement deltas are authored against a *base* pose
         // (the matching locomotion/idle stance), resolved via the
         // content/modes[] graph — see Animation.OverlayBasePose.
@@ -122,10 +123,11 @@ public static class ExtractAnimationCommand
         return null;
     }
 
-    private static IReadOnlyList<NodeTransform> BuildDefaults(Skeleton skeleton, TagFile jmad, TagFile? renderModel)
+    private static IReadOnlyList<NodeTransform> BuildDefaults(Skeleton skeleton, TagFile jmad, TagFile? renderModel, bool objectSpaceAnimData)
     {
-        var byName = new Dictionary<string, NodeTransform>();
-
+        // Lower priority: jmad's `additional node data`, per skeleton node.
+        // Reach/H4 store these in object/model space; H2/H3 parent-local.
+        var animByName = new Dictionary<string, NodeTransform>();
         var addl = jmad.Root.FieldPath("additional node data")?.AsBlock();
         if (addl is not null)
             for (int i = 0; i < addl.Count; i++)
@@ -134,14 +136,23 @@ public static class ExtractAnimationCommand
                 if (elem is null) continue;
                 string? name = elem.ReadStringId("node name");
                 if (string.IsNullOrEmpty(name)) continue;
-                byName[name] = new NodeTransform
+                animByName[name] = new NodeTransform
                 {
                     Translation = elem.ReadPoint3d("default translation"),
                     Rotation = elem.ReadQuat("default rotation"),
                     Scale = elem.ReadReal("default scale") ?? 1.0f,
                 };
             }
+        var anim = skeleton.Nodes
+            .Select(n => animByName.TryGetValue(n.Name, out var t) ? t : NodeTransform.Identity)
+            .ToList();
+        // Reach/H4 `additional node data` is object-space → convert to local
+        // (Foundry's world_to_local). H2/H3 are already local — leave as-is.
+        if (objectSpaceAnimData)
+            anim = skeleton.ObjectToLocal(anim);
 
+        // Higher priority: render_model `nodes[]` (always parent-local).
+        var rmByName = new Dictionary<string, NodeTransform>();
         var rmNodes = renderModel?.Root.FieldPath("nodes")?.AsBlock();
         if (rmNodes is not null)
             for (int i = 0; i < rmNodes.Count; i++)
@@ -150,7 +161,7 @@ public static class ExtractAnimationCommand
                 if (elem is null) continue;
                 string? name = elem.ReadStringId("name");
                 if (string.IsNullOrEmpty(name)) continue;
-                byName[name] = new NodeTransform
+                rmByName[name] = new NodeTransform
                 {
                     Translation = elem.ReadPoint3d("default translation"),
                     Rotation = elem.ReadQuat("default rotation"),
@@ -159,9 +170,15 @@ public static class ExtractAnimationCommand
             }
 
         return skeleton.Nodes
-            .Select(node => byName.TryGetValue(node.Name, out var t) ? t : NodeTransform.Identity)
+            .Select((node, i) => rmByName.TryGetValue(node.Name, out var t) ? t : anim[i])
             .ToList();
     }
+
+    /// <summary>Whether a jmad's `additional node data` rest pose is in
+    /// object/model space (Reach/H4) rather than parent-local (H2/H3).
+    /// Detected by the Reach-style packed-data-sizes layout.</summary>
+    private static bool AdditionalNodeDataIsObjectSpace(Animation animation) =>
+        animation.Groups.Any(g => g.DataSizes?.Layout() == SizeLayout.Reach);
 
     //==== output ====
 
@@ -221,7 +238,8 @@ public static class ExtractAnimationCommand
         var skeleton = Skeleton.FromTag(tag);
         if (skeleton.IsEmpty)
             throw new CliError("model_animations has no nodes — JMA export needs a skeleton");
-        var defaults = BuildDefaults(skeleton, tag, null);
+        // Halo CE `additional node data` is parent-local (no conversion).
+        var defaults = BuildDefaults(skeleton, tag, null, false);
 
         var target = OutputTarget.FromArgs(output);
         string stem = Path.GetFileNameWithoutExtension(path);

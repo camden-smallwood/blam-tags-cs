@@ -195,8 +195,11 @@ public sealed class JmsFile
         var triangles = new List<JmsTriangle>();
         var emittedSections = new List<int>();
 
-        string[] lodFields = ["L1 section index", "L2 section index", "L3 section index",
-                              "L4 section index", "L5 section index", "L6 section index"];
+        // H2 `Lx` slots run low→high: L1 = "super low", L6 = "hollywood"
+        // (highest detail). Walk HIGH→LOW so the first in-range index is the
+        // highest available LOD (unused slots can hold stale/garbage values).
+        string[] lodFields = ["L6 section index", "L5 section index", "L4 section index",
+                              "L3 section index", "L2 section index", "L1 section index"];
 
         foreach (var region in regionsBlock.Elements())
         {
@@ -219,9 +222,21 @@ public sealed class JmsFile
                 int classification = (int)(section.ReadIntAny("global_geometry_classification_enum_definition") ?? 1);
                 short rigidNode = (short)(section.ReadIntAny("rigid node") ?? -1);
 
-                var sd = section.FieldPath("section data")?.AsBlock()?.Element(0)
-                    ?.FieldPath("section")?.AsStruct();
-                if (sd is null) continue;
+                var sdElem = section.FieldPath("section data")?.AsBlock()?.Element(0);
+                var sd = sdElem?.FieldPath("section")?.AsStruct();
+                if (sdElem is null || sd is null) continue;
+
+                // H2 stores per-vertex bone indices LOCAL to the section; the
+                // section's `node map` remaps them to global skeleton nodes
+                // (Reclaimer's nodeMap[blendIndex]). Without this, skinned H2
+                // meshes bind to the wrong bones — fine at the bind pose, but
+                // every animation explodes the model. Empty map = already global.
+                var nodeMap = new List<short>();
+                if (sdElem.FieldPath("node map")?.AsBlock() is { } nmBlock)
+                    foreach (var e in nmBlock.Elements())
+                        nodeMap.Add((short)(e.ReadIntAny("node index") ?? -1));
+                short Remap(short idx) =>
+                    nodeMap.Count > 0 && idx >= 0 && idx < nodeMap.Count ? nodeMap[idx] : idx;
                 var rawV = sd.FieldPath("raw vertices")?.AsBlock();
                 var strip = sd.FieldPath("strip indices")?.AsBlock();
                 var parts = sd.FieldPath("parts")?.AsBlock();
@@ -264,11 +279,14 @@ public sealed class JmsFile
                             if (classification <= 1)
                             {
                                 jv.NodeSets.Clear();
-                                jv.NodeSets.Add(((short)System.Math.Max((int)rigidNode, 0), 1.0f));
+                                jv.NodeSets.Add((Remap((short)System.Math.Max((int)rigidNode, 0)), 1.0f));
                             }
-                            else if (jv.NodeSets.Count == 0 && rigidNode >= 0)
+                            else
                             {
-                                jv.NodeSets.Add((rigidNode, 1.0f));
+                                for (int ni = 0; ni < jv.NodeSets.Count; ni++)
+                                    jv.NodeSets[ni] = (Remap(jv.NodeSets[ni].Item1), jv.NodeSets[ni].Item2);
+                                if (jv.NodeSets.Count == 0 && rigidNode >= 0)
+                                    jv.NodeSets.Add((Remap(rigidNode), 1.0f));
                             }
                             vertices.Add(jv);
                         }

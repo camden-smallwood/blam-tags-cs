@@ -56,11 +56,30 @@ public sealed class AnimationGroup
     public bool WorldRelative { get; init; }
     public IReadOnlyList<ObjectSpaceParentNode> ObjectSpaceParents { get; init; } = [];
 
+    /// <summary>Halo 4 graph-level shared-static value pool (<c>codec data/
+    /// shared_static_codec</c>). The H4 static rest pose isn't in the
+    /// per-animation blob — SharedStatic (codec 11) stores only int16 indices
+    /// into this graph-shared pool. Shared across all groups of one tag;
+    /// <c>null</c> for non-H4 / tags without it.</summary>
+    public SharedStaticPool? SharedStatic { get; init; }
+
     public bool MovementTypeMismatch =>
         FrameInfoType is { } a && MovementType is { } b && a != b;
 
     /// <summary>Decode the blob into an <see cref="AnimationClip"/>.</summary>
     public AnimationClip Decode() => AnimationCodec.Decode(this);
+}
+
+/// <summary>Halo 4's graph-level shared-static value pool — decoded once from
+/// <c>codec data/shared_static_codec/{rotations,translations,scale}</c>. The
+/// per-animation <c>compressed_static_pose</c> codec stream (codec 11) holds
+/// int16 indices into these. Rotations are 4×int16/0x7FFF quaternions;
+/// translations/scales are raw f32. RE'd from the H4 Xbox debug build.</summary>
+public sealed class SharedStaticPool
+{
+    public List<RealQuaternion> Rotations { get; } = [];
+    public List<RealPoint3d> Translations { get; } = [];
+    public List<float> Scales { get; } = [];
 }
 
 /// <summary>All animations in a jmad, paired with their resource-group
@@ -109,6 +128,9 @@ public sealed class Animation
                 groupMemberTable.Add(members);
             }
         }
+
+        // Halo 4 graph-level shared-static value pool (read once, shared).
+        var sharedStatic = ReadSharedStaticPool(root);
 
         var animations = new List<AnimationGroup>(animationsBlock.Count);
         for (int i = 0; i < animationsBlock.Count; i++)
@@ -173,6 +195,7 @@ public sealed class Animation
                 Blob = blob,
                 WorldRelative = worldRelative,
                 ObjectSpaceParents = objectSpaceParents,
+                SharedStatic = sharedStatic,
             });
         }
 
@@ -315,8 +338,43 @@ public sealed class Animation
     /// StaticDataSize(s) UncompressedDataSize(i) CompressedDataSize(i)); v0
     /// stores the same as separate inline fields. <c>animated_codec =
     /// uncompressed + compressed</c>.</summary>
+    /// <summary>Read Halo 4's graph-level shared-static value pool from
+    /// <c>codec data/shared_static_codec/{rotations,translations,scale}</c>.
+    /// <c>null</c> when absent (non-H4 / no shared-static). Rotations are
+    /// 4×int16/0x7FFF quaternions; translations are (x,y,z) f32; scales f32.</summary>
+    private static SharedStaticPool? ReadSharedStaticPool(TagStruct root)
+    {
+        const string Base = "codec data/shared_static_codec";
+        var rotations = root.FieldPath($"{Base}/rotations")?.AsBlock();
+        if (rotations is null) return null;
+        var pool = new SharedStaticPool();
+        foreach (var e in rotations.Elements())
+        {
+            float G(string n) => (e.ReadIntAny(n) ?? 0) / 32767.0f;
+            var q = new RealQuaternion(G("i"), G("j"), G("k"), G("w"));
+            pool.Rotations.Add(System.MathF.Sqrt(q.LengthSquared()) <= 1e-6f ? new RealQuaternion(0, 0, 0, 1) : q.Normalized());
+        }
+        if (root.FieldPath($"{Base}/translations")?.AsBlock() is { } tb)
+            foreach (var e in tb.Elements())
+                pool.Translations.Add(new RealPoint3d(e.ReadReal("x") ?? 0, e.ReadReal("y") ?? 0, e.ReadReal("z") ?? 0));
+        if (root.FieldPath($"{Base}/scale")?.AsBlock() is { } sb)
+            foreach (var e in sb.Elements())
+                pool.Scales.Add(e.ReadReal("scale") ?? 1.0f);
+        return pool;
+    }
+
     private static PackedDataSizes? ReadH2DataSizes(TagStruct anim)
     {
+        // The played/extracted animated codec stream is the COMPRESSED block
+        // (laid out right after the static block, with the node flags directly
+        // after it); the trailing UNCOMPRESSED block is an unplayed lossless
+        // mirror — NOT part of the animated stream and NOT counted toward the
+        // flag offset. Summing the two pushed the flag offset ~14 KB into the
+        // mirror and scrambled every node's transform. Fall back to
+        // uncompressed only when there is no compressed block.
+        static long AnimatedStream(long uncompressed, long compressed) =>
+            compressed > 0 ? compressed : uncompressed;
+
         PackedDataSizes Build(long staticData, long animated, long staticFlags, long animatedFlags, long movement, long pill) =>
             new()
             {
@@ -337,7 +395,7 @@ public sealed class Animation
             foreach (var f in s.Fields())
                 if (f.Value is { } v && IntValue(v) is { } iv) vals.Add(iv);
             if (vals.Count >= 7)
-                return Build(vals[4], vals[5] + vals[6], vals[0], vals[1], vals[2], vals[3]);
+                return Build(vals[4], AnimatedStream(vals[5], vals[6]), vals[0], vals[1], vals[2], vals[3]);
         }
 
         // v0: separate inline size fields.
@@ -346,7 +404,7 @@ public sealed class Animation
         if (staticFlags0 is null || animatedFlags0 is null) return null;
         return Build(
             anim.ReadIntAny("default_data size") ?? 0,
-            (anim.ReadIntAny("uncompressed_data size") ?? 0) + (anim.ReadIntAny("compressed_data size") ?? 0),
+            AnimatedStream(anim.ReadIntAny("uncompressed_data size") ?? 0, anim.ReadIntAny("compressed_data size") ?? 0),
             staticFlags0.Value, animatedFlags0.Value, anim.ReadIntAny("movement_data size") ?? 0, 0);
     }
 
